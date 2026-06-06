@@ -10,7 +10,7 @@ use async_openai::{
 use async_trait::async_trait;
 use schemars::r#gen::SchemaGenerator;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 // ─── OpenAIClient (taken as-is from shotef) ──────────────────────────
 
@@ -170,8 +170,12 @@ pub async fn run_loop_with_max<Agent: AgentLoop>(
     let mut history: Vec<(Agent::Request, Agent::Response)> = Vec::new();
     let mut current_request = agent.initial_input();
 
-    for _ in 0..max_iterations {
+    info!(target: "da_harness::loop", system = %agent.system_prompt(), "starting agent loop");
+
+    for iteration in 0..max_iterations {
         let user_message = build_user_prompt(&agent, &history, &current_request);
+
+        info!(target: "da_harness::loop", iteration, prompt = %user_message, ">> sending to LLM");
 
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
@@ -190,6 +194,8 @@ pub async fn run_loop_with_max<Agent: AgentLoop>(
             .chat(messages, 0.6)
             .await
             .context("LLM chat call failed")?;
+
+        info!(target: "da_harness::loop", iteration, reply = %response_text, "<< raw LLM reply");
 
         let response: Agent::Response = serde_json::from_str(&response_text)
             .context(format!("failed to deserialize LLM response: {}", response_text))?;
