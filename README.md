@@ -14,6 +14,7 @@ Key features:
 - **Schema-aware prompts** — JSON schemas are generated from your types via `schemars` and embedded in prompts, with shared type definitions deduplicated.
 - **Few-shot examples** — Provide example request/response pairs that are formatted into the prompt automatically.
 - **Conversation history** — Full request/response history is included in each iteration so the LLM has context.
+- **Automatic context compaction** — When prompt usage approaches the model's context window, the loop automatically summarizes earlier turns and truncates history to keep prompts within budget.
 - **Extensible prompts** — Use `extend_prompt` to inject dynamic context based on conversation state.
 - **Health checking** — Built-in endpoint health checks and readiness polling for `OpenAIClient`.
 
@@ -23,7 +24,7 @@ Add `da-harness` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.1" }
+da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.2" }
 ```
 
 Define your agent by implementing the `AgentLoop` trait:
@@ -114,7 +115,39 @@ async fn main() {
    - `LoopControl::Continue(next_request)` — executes your controller logic and feeds the result back as the next iteration's input.
    - `LoopControl::Stop(output)` — ends the loop and returns the final output value.
 
-By default there is no iteration cap (the loop runs until the agent returns `Stop`). Use [`LoopConfigBuilder`] to set an optional `max_iterations` limit and a [`CompactPolicy`] for compaction behavior. When a maximum context window size is known (via `LLMConfig`, a `CompactPolicy::Override`, or by querying the server's `/models` endpoint), the loop will automatically trigger history compaction once ~75% of the window has been used, asking the LLM to produce a compact "previous sessions summary" targeting ~25% of the window and truncating the retained typed history.
+By default there is no iteration cap (the loop runs until the agent returns `Stop`). Use [`LoopConfigBuilder`] to set an optional `max_iterations` limit and configure compaction behavior.
+
+## Context Compaction
+
+Long-running agents can exceed the model's context window as conversation history grows. `da-harness` handles this automatically:
+
+1. **Discovery** — On loop start, the framework queries the server's `/models` endpoint (or reads `LLMConfig::max_context_tokens`) to learn the model's maximum context window in tokens.
+2. **Monitoring** — After each LLM response, the framework checks the `prompt_tokens` count reported by the server.
+3. **Trigger** — When prompt usage reaches **75%** of the known window, a separate summarization call is issued. The LLM produces a compact summary targeting ~25% of the window.
+4. **Rewrite** — The summary is injected into subsequent prompts under the `PREVIOUS SESSIONS SUMMARY` heading. Old typed history entries are dropped (the most recent few turns are kept verbatim).
+
+Compaction is best-effort: if the summarization call fails, a warning is logged and the loop continues with the current history. The compaction call itself does not count against the iteration limit.
+
+### Configuration
+
+Control compaction via [`CompactPolicy`] on your [`LoopConfigBuilder`]:
+
+```rust
+// Default: auto-discover context window from the server.
+let config = LoopConfigBuilder::default().try_build().unwrap();
+
+// Disable compaction entirely.
+let config = LoopConfigBuilder::default()
+    .compact_policy(CompactPolicy::NoCompact)
+    .try_build()
+    .unwrap();
+
+// Force a specific window size (useful for testing).
+let config = LoopConfigBuilder::default()
+    .compact_policy(CompactPolicy::Override(700))
+    .try_build()
+    .unwrap();
+```
 
 ## Prompt Structure
 
