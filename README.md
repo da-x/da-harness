@@ -113,7 +113,7 @@ async fn main() {
    - `LoopControl::Continue(next_request)` — executes your controller logic and feeds the result back as the next iteration's input.
    - `LoopControl::Stop(output)` — ends the loop and returns the final output value.
 
-The default maximum iteration count is 10. Use `run_loop_with_max` to customize this limit.
+The default maximum iteration count is 10. Use `run_loop_with_max` (or `run_loop_with_max_and_context`) to customize the iteration limit. When a maximum context window size is known (via `LLMConfig`, an explicit parameter, or by querying the server's `/models` endpoint), the loop will automatically trigger history compaction once ~75% of the window has been used, asking the LLM to produce a compact "previous sessions summary" targeting ~25% of the window and truncating the retained typed history.
 
 ## Prompt Structure
 
@@ -124,7 +124,8 @@ Each iteration sends a prompt with these sections:
 | User Prompt | Your agent's instructions (from `user_prompt()`) |
 | JSON Schema | Combined `Request` and `Response` schemas with shared definitions |
 | Examples | Few-shot example pairs (from `examples()`) |
-| Conversation History | Prior request/response pairs from the loop |
+| Previous Sessions Summary | Optional compact summary of earlier turns (produced automatically by context compaction when the window limit is known) |
+| Conversation History | Prior request/response pairs from the loop (may be truncated after compaction) |
 | Additional Context | Dynamic content from `extend_prompt()` (optional) |
 | Current Input | The serialized current request as JSON |
 

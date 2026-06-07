@@ -131,6 +131,7 @@ fn client_from_env() -> OpenAIClient {
         api_base,
         model_name,
         api_key,
+        max_context_tokens: None,
     })
 }
 

@@ -116,6 +116,12 @@ pub struct LLMConfig {
     pub model_name: String,
     /// The API key for authentication. May be empty for local endpoints.
     pub api_key: String,
+    /// Optional explicit maximum context window size in tokens for this model.
+    ///
+    /// When set, this value is used for compaction threshold calculations
+    /// instead of discovering it from the server's `/models` endpoint.
+    /// Useful for testing compaction with a deliberately small window.
+    pub max_context_tokens: Option<usize>,
 }
 
 impl Default for LLMConfig {
@@ -126,6 +132,7 @@ impl Default for LLMConfig {
             api_base: "http://127.0.0.1:4242/v1".to_owned(),
             model_name: "LocalModel".to_owned(),
             api_key: "".to_owned(),
+            max_context_tokens: None,
         }
     }
 }
@@ -134,10 +141,17 @@ impl Default for LLMConfig {
 ///
 /// Wraps `async_openai::Client` with convenience methods for health checking
 /// and readiness polling.
+///
+/// The client can optionally know the model's maximum context window size
+/// (in tokens), either from [`LLMConfig::max_context_tokens`] or discovered
+/// at runtime by querying the `/models` endpoint. This information is used
+/// by [`run_loop_with_max_and_context`] (and friends) to trigger automatic
+/// history compaction when context usage approaches the limit.
 #[derive(Clone)]
 pub struct OpenAIClient {
     client: Client<OpenAIConfig>,
     model_name: String,
+    max_context_tokens: Option<usize>,
 }
 
 impl Default for OpenAIClient {
@@ -165,6 +179,7 @@ impl OpenAIClient {
         Self {
             client: Client::with_config(async_config),
             model_name: config.model_name,
+            max_context_tokens: config.max_context_tokens,
         }
     }
 
@@ -173,19 +188,116 @@ impl OpenAIClient {
         &self.model_name
     }
 
+    /// Returns the known maximum context window size in tokens, if known.
+    ///
+    /// This may have been provided at construction time via [`LLMConfig`]
+    /// or populated by a prior call to [`OpenAIClient::discover_max_context_tokens`].
+    pub fn max_context_tokens(&self) -> Option<usize> {
+        self.max_context_tokens
+    }
+
+    /// Queries the server's `/models` endpoint for the configured model and
+    /// attempts to extract its maximum context window length.
+    ///
+    /// Many OpenAI-compatible servers (notably vLLM) include an extension field
+    /// such as `max_model_len` (or `context_length`, `n_ctx`, etc.) on the model
+    /// object returned by `/models`. This method parses the raw response (the
+    /// typed `async_openai` model object only contains the standard four fields)
+    /// and looks for several common field names.
+    ///
+    /// If a positive integer value is found for the current `model_name`, it is
+    /// cached in the client and returned as `Some(n)`.
+    ///
+    /// Returns `Ok(None)` if the model was listed but no recognized context field
+    /// was present. Returns an error only on transport / parse failures.
+    ///
+    /// This is called automatically by the `run_loop*` entry points when no
+    /// explicit max context is supplied.
+    pub async fn discover_max_context_tokens(&mut self) -> anyhow::Result<Option<usize>> {
+        use async_openai::config::Config;
+
+        let cfg = self.client.config();
+        let url = cfg.url("/models");
+        let headers = cfg.headers();
+        let qparams = cfg.query();
+
+        let resp = reqwest::Client::new()
+            .get(url)
+            .headers(headers)
+            .query(&qparams)
+            .send()
+            .await
+            .context("sending GET /models for context discovery")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET /models failed: {} body: {}", status, body);
+        }
+
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .context("decoding /models response as JSON")?;
+
+        let data = match json.get("data").and_then(|d| d.as_array()) {
+            Some(arr) => arr,
+            None => return Ok(None),
+        };
+
+        let target = self.model_name.as_str();
+        for entry in data {
+            if entry.get("id").and_then(|i| i.as_str()) != Some(target) {
+                continue;
+            }
+            // Look for common extension fields used by vLLM, SGLang, and others.
+            for key in [
+                "max_model_len",
+                "max_context_length",
+                "context_length",
+                "n_ctx",
+                "max_seq_len",
+                "context_window",
+                "max_tokens",
+            ] {
+                if let Some(n) = entry.get(key).and_then(|v| v.as_u64()) && n > 0 {
+                    let n = n as usize;
+                    self.max_context_tokens = Some(n);
+                    return Ok(Some(n));
+                }
+            }
+            // Model found but no recognized context field.
+            return Ok(None);
+        }
+        Ok(None)
+    }
+
     /// Sends a chat completion request and returns the assistant's text response.
     ///
-    /// # Arguments
-    /// * `messages` — The conversation messages to send.
-    /// * `temperature` — Sampling temperature (0.0 to 1.0).
-    ///
-    /// # Errors
-    /// Returns an error if the API call fails or the response contains no content.
+    /// This is a convenience wrapper around [`OpenAIClient::chat_with_usage`]
+    /// that discards token usage information.
     pub async fn chat(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         temperature: f32,
     ) -> anyhow::Result<String> {
+        self.chat_with_usage(messages, temperature)
+            .await
+            .map(|(text, _)| text)
+    }
+
+    /// Sends a chat completion request and returns the assistant's text response
+    /// along with the number of prompt tokens used for the request (if the server
+    /// reported usage).
+    ///
+    /// The returned `Option<u32>` is the `prompt_tokens` value from the
+    /// `CompletionUsage` object in the response (when present). This is the
+    /// primary signal used by the run loop to decide when to trigger compaction.
+    pub async fn chat_with_usage(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        temperature: f32,
+    ) -> anyhow::Result<(String, Option<u32>)> {
         let request = CreateChatCompletionRequestArgs::default()
             .model(self.model_name())
             .messages(messages)
@@ -194,11 +306,14 @@ impl OpenAIClient {
 
         let response = self.client.chat().create(request).await?;
 
-        response.choices[0]
+        let text = response.choices[0]
             .message
             .content
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("LLM returned no content"))
+            .ok_or_else(|| anyhow::anyhow!("LLM returned no content"))?;
+
+        let prompt_tokens = response.usage.map(|u| u.prompt_tokens);
+        Ok((text, prompt_tokens))
     }
 
     /// Checks whether the LLM endpoint is reachable by sending a minimal
@@ -351,6 +466,9 @@ pub trait AgentLoop: Sized {
 /// # Errors
 /// Returns an error if the LLM API fails, response deserialization fails,
 /// or the maximum iteration count is exceeded.
+///
+/// Automatic context compaction (when a maximum context window is known) is
+/// still active; see [`run_loop_with_max_and_context`].
 pub async fn run_loop<Agent: AgentLoop>(
     client: OpenAIClient,
     agent: Agent,
@@ -360,34 +478,98 @@ pub async fn run_loop<Agent: AgentLoop>(
 
 /// Runs an [`AgentLoop`] with a configurable maximum iteration count.
 ///
-/// Each iteration builds a prompt from the agent's system prompt, user prompt,
-/// JSON schemas (with shared type definitions), examples, conversation history,
-/// and the current request. The LLM response is deserialized into the agent's
-/// `Response` type and passed to [`AgentLoop::iteration`] for control decisions.
-///
-/// # Arguments
-/// * `client` — The [`OpenAIClient`] to use for chat completions.
-/// * `agent` — The agent implementing [`AgentLoop`].
-/// * `max_iterations` — Maximum number of loop iterations before failing.
-///
-/// # Returns
-/// The agent's final output value on success.
-///
-/// # Errors
-/// Returns an error if the LLM API fails, response deserialization fails,
-/// or `max_iterations` is exceeded.
+/// This is a convenience wrapper around [`run_loop_with_max_and_context`]
+/// that does not force a context window size (discovery or config may still
+/// provide one, enabling compaction).
 pub async fn run_loop_with_max<Agent: AgentLoop>(
     client: OpenAIClient,
     agent: Agent,
     max_iterations: usize,
 ) -> anyhow::Result<Agent::Output> {
+    run_loop_with_max_and_context(client, agent, max_iterations, None).await
+}
+
+/// Runs an [`AgentLoop`] with a configurable iteration limit and an explicit
+/// maximum context window size (in tokens) for compaction decisions.
+///
+/// # Compaction
+///
+/// On entry, if `max_context_tokens` is `Some(n)`, that value is used.
+/// Otherwise the client's configured value (from [`LLMConfig`]) is used.
+/// If still unknown, the client attempts to discover it by calling
+/// [`OpenAIClient::discover_max_context_tokens`] (which probes `/models` for
+/// fields such as `max_model_len`).
+///
+/// After each LLM response, if the number of prompt tokens reported by the
+/// server for that turn is >= 75% of the known maximum context window, a
+/// separate summarization request is issued. The summarizer is instructed to
+/// produce a compact "previous sessions summary" that should occupy roughly
+/// 25% of the window. On success:
+///
+/// * The summary is stored and will appear in subsequent prompts under the
+///   heading `## PREVIOUS SESSIONS SUMMARY`.
+/// * Old entries are dropped from the in-memory typed history (only the most
+///   recent few turns are kept verbatim).
+///
+/// Compaction is best-effort: if the summarization call fails, a warning is
+/// logged and the loop continues with the current history.
+///
+/// The compaction chat call itself does not count against `max_iterations`.
+///
+/// # Arguments
+/// * `client` — The [`OpenAIClient`] to use.
+/// * `agent` — The agent implementing [`AgentLoop`].
+/// * `max_iterations` — Safety cap on the number of agent iterations.
+/// * `max_context_tokens` — Optional explicit window size. When `Some`, this
+///   overrides config and skips discovery. Pass a small value (e.g. 800) in
+///   tests to force compaction to be exercised.
+///
+/// # Returns
+/// The agent's final [`AgentLoop::Output`] on success.
+///
+/// # Errors
+/// Returns an error if the LLM API fails, deserialization fails, or the
+/// iteration limit is exceeded.
+pub async fn run_loop_with_max_and_context<Agent: AgentLoop>(
+    mut client: OpenAIClient,
+    agent: Agent,
+    max_iterations: usize,
+    max_context_tokens: Option<usize>,
+) -> anyhow::Result<Agent::Output> {
+    // Determine the effective max context window (in tokens).
+    let mut max_context: Option<usize> =
+        max_context_tokens.or_else(|| client.max_context_tokens());
+
+    if max_context.is_none() {
+        match client.discover_max_context_tokens().await {
+            Ok(Some(n)) => {
+                info!(target: "da_harness::loop", max_context_tokens = n, "discovered model context window");
+                max_context = Some(n);
+            }
+            Ok(None) => {
+                warn!(target: "da_harness::loop", "server did not report a context window for model; compaction disabled");
+            }
+            Err(e) => {
+                warn!(target: "da_harness::loop", error = %e, "context window discovery failed; compaction disabled");
+            }
+        }
+    } else if max_context_tokens.is_some() && let Some(c) = max_context {
+        info!(target: "da_harness::loop", max_context_tokens = c, "using explicit max context (override)");
+    }
+
+    if max_context.is_none() {
+        warn!(target: "da_harness::loop", "no max context window known; compaction will not be triggered");
+    }
+
     let mut history: Vec<(Agent::Request, Agent::Response)> = Vec::new();
     let mut current_request = agent.initial_input();
+    let mut previous_summary: Option<String> = None;
 
     info!(target: "da_harness::loop", system = %agent.system_prompt(), "starting agent loop");
 
     for iteration in 0..max_iterations {
-        let user_message = build_user_prompt(&agent, &history, &current_request);
+        let user_message =
+            build_user_prompt(&agent, &history, &current_request, previous_summary.as_deref());
 
         info!(target: "da_harness::loop", iteration, prompt = %user_message, ">> sending to LLM");
 
@@ -404,21 +586,69 @@ pub async fn run_loop_with_max<Agent: AgentLoop>(
                 .into(),
         ];
 
-        let response_text = client
-            .chat(messages, 0.6)
+        let (response_text, prompt_tokens) = client
+            .chat_with_usage(messages, 0.6)
             .await
             .context("LLM chat call failed")?;
 
-        info!(target: "da_harness::loop", iteration, reply = %response_text, "<< raw LLM reply");
+        info!(target: "da_harness::loop", iteration, reply = %response_text, used_prompt_tokens = ?prompt_tokens, "<< raw LLM reply");
 
-        let response: Agent::Response = serde_json::from_str(&response_text)
+        let json_text = extract_json(&response_text);
+        let response: Agent::Response = serde_json::from_str(json_text)
             .context(format!("failed to deserialize LLM response: {}", response_text))?;
 
         history.push((current_request, response.clone()));
 
+        let used = prompt_tokens;
+
         match agent.iteration(response, &history).await {
             LoopControl::Continue(next_request) => {
                 current_request = next_request;
+
+                // Check for compaction after each response when we know we will continue.
+                if let (Some(max), Some(used_tokens)) = (max_context, used)
+                    && (used_tokens as usize) >= ((max as f64 * 0.75) as usize)
+                {
+                    let target = max / 4; // aim for ~25%
+                    info!(
+                        target: "da_harness::loop",
+                        used = used_tokens,
+                        max,
+                        target,
+                        "context usage >= 75% of window; triggering compaction"
+                    );
+
+                    match compact_conversation::<Agent>(
+                        &client,
+                        &history,
+                        previous_summary.as_deref(),
+                        target,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            previous_summary = Some(summary);
+                            // Truncate typed history: keep only the most recent few turns.
+                            const KEEP_LAST: usize = 3;
+                            let len = history.len();
+                            if len > KEEP_LAST {
+                                history.drain(0..len - KEEP_LAST);
+                                info!(
+                                    target: "da_harness::loop",
+                                    kept = KEEP_LAST,
+                                    "history truncated after compaction"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "da_harness::loop",
+                                error = %e,
+                                "compaction summarization failed; continuing with full history"
+                            );
+                        }
+                    }
+                }
             }
             LoopControl::Stop(output) => {
                 return Ok(output);
@@ -461,13 +691,15 @@ fn build_combined_schema<Agent: AgentLoop>() -> serde_json::Value {
 /// 1. The agent's user prompt instructions
 /// 2. Combined JSON schema for request and response types
 /// 3. Few-shot examples (if any)
-/// 4. Conversation history (request/response pairs)
-/// 5. Extended context from [`AgentLoop::extend_prompt`] (if provided)
-/// 6. The current serialized request as the active input
+/// 4. Optional "previous sessions summary" produced by automatic compaction
+/// 5. Conversation history (request/response pairs) — may be truncated after compaction
+/// 6. Extended context from [`AgentLoop::extend_prompt`] (if provided)
+/// 7. The current serialized request as the active input
 fn build_user_prompt<Agent: AgentLoop>(
     agent: &Agent,
     history: &[(Agent::Request, Agent::Response)],
     current_request: &Agent::Request,
+    previous_summary: Option<&str>,
 ) -> String {
     let mut buf = String::new();
 
@@ -500,7 +732,17 @@ fn build_user_prompt<Agent: AgentLoop>(
         }
     }
 
-    // History pairs
+    // Previous sessions summary (result of compaction / rewritten history)
+    if let Some(summary) = previous_summary {
+        let trimmed = summary.trim();
+        if !trimmed.is_empty() {
+            buf.push_str("## PREVIOUS SESSIONS SUMMARY\n\n");
+            buf.push_str(trimmed);
+            buf.push_str("\n\n");
+        }
+    }
+
+    // History pairs (may have been truncated by compaction)
     if !history.is_empty() {
         buf.push_str("## CONVERSATION HISTORY\n\n");
         for (req, resp) in history {
@@ -527,6 +769,138 @@ fn build_user_prompt<Agent: AgentLoop>(
     buf.push('\n');
 
     buf
+}
+
+/// Extracts the JSON content from an LLM reply that may be wrapped in
+/// markdown code fences (e.g. "```json\n{...}\n```" or "```\n{...}\n```").
+///
+/// Many local models emit fenced JSON even when instructed to output raw JSON.
+/// This helper makes the harness tolerant of that common behavior while
+/// preserving the original text for error reporting.
+fn extract_json(text: &str) -> &str {
+    let t = text.trim();
+    if let Some(start) = t.find("```") {
+        let mut rest = &t[start + 3..];
+        // Skip optional language specifier: json, JSON, Json, etc.
+        rest = rest.trim_start();
+        if rest.len() >= 4 {
+            let prefix = &rest[..4].to_ascii_lowercase();
+            if prefix == "json" || prefix.starts_with("json") {
+                rest = &rest[4..].trim_start();
+            }
+        }
+        if let Some(end) = rest.find("```") {
+            return rest[..end].trim();
+        }
+        // No closing fence; return everything after the opening fence.
+        return rest.trim();
+    }
+    t
+}
+
+/// Performs a separate LLM call to produce a compact summary of the current
+/// conversation history (plus any previous summary) that is intended to be
+/// small enough to occupy roughly 25% of the model's context window.
+///
+/// The summary is plain text (not a typed agent turn). On success it is
+/// injected by the run loop under `## PREVIOUS SESSIONS SUMMARY` and the
+/// typed history is truncated.
+async fn compact_conversation<Agent: AgentLoop>(
+    client: &OpenAIClient,
+    history: &[(Agent::Request, Agent::Response)],
+    previous_summary: Option<&str>,
+    target_tokens: usize,
+) -> anyhow::Result<String> {
+    if history.is_empty() && previous_summary.is_none() {
+        return Ok(String::new());
+    }
+
+    let system = "You are a context compression assistant for a structured JSON agent loop. \
+                  Produce a dense, factual memory of everything important that happened so far.";
+
+    let mut user = String::new();
+    if let Some(s) = previous_summary {
+        user.push_str("Summary of turns before the recent history below:\n");
+        user.push_str(s.trim());
+        user.push_str("\n\n");
+    }
+
+    user.push_str("Recent turns (INPUT/OUTPUT pairs, oldest first):\n\n");
+    for (i, (req, resp)) in history.iter().enumerate() {
+        let rj = serde_json::to_string(req).unwrap_or_default();
+        let sj = serde_json::to_string(resp).unwrap_or_default();
+        user.push_str(&format!("Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n", i + 1, rj, sj));
+    }
+
+    user.push_str(&format!(
+        "Create a single concise summary of the entire conversation (including any prior summary). \
+         Preserve goals, key facts, discovered state, decisions made, and what remains to be done. \
+         This summary will be re-injected by the controller in future prompts under the heading \
+         'PREVIOUS SESSIONS SUMMARY'. Target size: approximately {} tokens (roughly {} characters). \
+         Output ONLY the summary text — no explanations, no JSON, no fences.",
+        target_tokens,
+        target_tokens.saturating_mul(4)
+    ));
+
+    let messages: Vec<ChatCompletionRequestMessage> = vec![
+        ChatCompletionRequestSystemMessageArgs::default()
+            .content(system)
+            .build()
+            .context("building compaction system message")?
+            .into(),
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(user)
+            .build()
+            .context("building compaction user message")?
+            .into(),
+    ];
+
+    let (mut summary, _usage) = client
+        .chat_with_usage(messages, 0.2)
+        .await
+        .context("compaction chat call failed")?;
+
+    // Best-effort second pass if the first summary is obviously too large
+    // (we have no tokenizer in v1; we rely on the instruction + crude length).
+    let rough = summary.len() / 4;
+    if rough > target_tokens.saturating_mul(2) && !summary.trim().is_empty() {
+        let mut stricter = String::new();
+        if let Some(s) = previous_summary {
+            stricter.push_str("Prior summary:\n");
+            stricter.push_str(s.trim());
+            stricter.push_str("\n\n");
+        }
+        stricter.push_str("Recent turns (INPUT/OUTPUT):\n\n");
+        for (i, (req, resp)) in history.iter().enumerate() {
+            let rj = serde_json::to_string(req).unwrap_or_default();
+            let sj = serde_json::to_string(resp).unwrap_or_default();
+            stricter.push_str(&format!("Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n", i + 1, rj, sj));
+        }
+        stricter.push_str(
+            "The previous summary was too long. Produce a MUCH shorter version that still \
+             contains the essential facts, decisions, and state. Target the requested token budget. \
+             Output only the summary text.",
+        );
+
+        let messages2: Vec<ChatCompletionRequestMessage> = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(system)
+                .build()
+                .context("building stricter compaction system message")?
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content(stricter)
+                .build()
+                .context("building stricter compaction user message")?
+                .into(),
+        ];
+
+        if let Ok((shorter, _)) = client.chat_with_usage(messages2, 0.2).await {
+            summary = shorter;
+        }
+    }
+
+    Ok(summary.trim().to_string())
 }
 
 #[cfg(test)]
