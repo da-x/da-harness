@@ -26,7 +26,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use da_harness::{AgentLoop, LoopControl, OpenAIClient, run_loop};
+//! use da_harness::{AgentLoop, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop};
 //! use async_trait::async_trait;
 //! use schemars::JsonSchema;
 //! use serde::{Deserialize, Serialize};
@@ -86,7 +86,8 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //! let client = OpenAIClient::new();
-//! let output = run_loop(client, MyAgent).await.unwrap();
+//! let config = LoopConfigBuilder::default().try_build().unwrap();
+//! let output = run_loop(client, MyAgent, config).await.unwrap();
 //! println!("Result: {}", output);
 //! # }
 //! ```
@@ -380,6 +381,61 @@ pub enum LoopControl<Agent: AgentLoop> {
     Stop(Agent::Output),
 }
 
+// ─── CompactPolicy ────────────────────────────────────────────────────
+
+/// Controls how the maximum context window size is determined for compaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompactPolicy {
+    /// Do not compact at all; the loop will never trigger summarization.
+    NoCompact,
+    /// Discover the model's context window from the server (via `/models`) or
+    /// from [`LLMConfig::max_context_tokens`]. This is the default.
+    #[default]
+    ModelDefault,
+    /// Use an explicit token budget, bypassing both config and discovery.
+    /// Useful for testing compaction with a deliberately small window.
+    Override(usize),
+}
+
+// ─── LoopConfig ───────────────────────────────────────────────────────
+
+/// Configuration for a single invocation of [`run_loop`].
+///
+/// Use the generated [`LoopConfigBuilder`] to set only the fields you care
+/// about; missing values fall back to sensible defaults.
+///
+/// # Example
+///
+/// ```ignore
+/// // Default: no iteration cap, auto-discover context window.
+/// let config = LoopConfigBuilder::default().try_build().unwrap();
+///
+/// // With iteration cap and explicit small context for testing compaction:
+/// let config = LoopConfigBuilder::default()
+///     .max_iterations(Some(30))
+///     .compact_policy(CompactPolicy::Override(700))
+///     .try_build()
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone, Default, derive_builder::Builder)]
+#[builder(build_fn(name = "try_build"))]
+pub struct LoopConfig {
+    /// Maximum number of agent iterations before the loop fails with an error.
+    ///
+    /// When `None`, the loop runs indefinitely until the agent returns
+    /// [`LoopControl::Stop`].
+    ///
+    /// Default: `None` (no iteration cap).
+    #[builder(default)]
+    pub max_iterations: Option<usize>,
+
+    /// Controls how the maximum context window size is determined for compaction.
+    ///
+    /// Default: [`CompactPolicy::ModelDefault`] (discover from server or config).
+    #[builder(default)]
+    pub compact_policy: CompactPolicy,
+}
+
 // ─── AgentLoop Trait ──────────────────────────────────────────────────
 
 /// Defines the contract for an LLM-driven agent that operates in an iterative loop.
@@ -452,114 +508,95 @@ pub trait AgentLoop: Sized {
 
 // ─── run_loop ────────────────────────────────────────────────────────
 
-/// Runs an [`AgentLoop`] with the default maximum of 10 iterations.
-///
-/// This is a convenience wrapper around [`run_loop_with_max`].
-///
-/// # Arguments
-/// * `client` — The [`OpenAIClient`] to use for chat completions.
-/// * `agent` — The agent implementing [`AgentLoop`].
-///
-/// # Returns
-/// The agent's final output value on success.
-///
-/// # Errors
-/// Returns an error if the LLM API fails, response deserialization fails,
-/// or the maximum iteration count is exceeded.
-///
-/// Automatic context compaction (when a maximum context window is known) is
-/// still active; see [`run_loop_with_max_and_context`].
-pub async fn run_loop<Agent: AgentLoop>(
-    client: OpenAIClient,
-    agent: Agent,
-) -> anyhow::Result<Agent::Output> {
-    run_loop_with_max(client, agent, 10).await
-}
-
-/// Runs an [`AgentLoop`] with a configurable maximum iteration count.
-///
-/// This is a convenience wrapper around [`run_loop_with_max_and_context`]
-/// that does not force a context window size (discovery or config may still
-/// provide one, enabling compaction).
-pub async fn run_loop_with_max<Agent: AgentLoop>(
-    client: OpenAIClient,
-    agent: Agent,
-    max_iterations: usize,
-) -> anyhow::Result<Agent::Output> {
-    run_loop_with_max_and_context(client, agent, max_iterations, None).await
-}
-
-/// Runs an [`AgentLoop`] with a configurable iteration limit and an explicit
-/// maximum context window size (in tokens) for compaction decisions.
+/// Runs an [`AgentLoop`] with the given [`OpenAIClient`], agent, and
+/// [`LoopConfig`].
 ///
 /// # Compaction
 ///
-/// On entry, if `max_context_tokens` is `Some(n)`, that value is used.
-/// Otherwise the client's configured value (from [`LLMConfig`]) is used.
-/// If still unknown, the client attempts to discover it by calling
-/// [`OpenAIClient::discover_max_context_tokens`] (which probes `/models` for
-/// fields such as `max_model_len`).
+/// The [`CompactPolicy`] from the config controls how the maximum context
+/// window size is determined:
 ///
-/// After each LLM response, if the number of prompt tokens reported by the
-/// server for that turn is >= 75% of the known maximum context window, a
-/// separate summarization request is issued. The summarizer is instructed to
-/// produce a compact "previous sessions summary" that should occupy roughly
-/// 25% of the window. On success:
+/// * [`CompactPolicy::NoCompact`] — compaction is disabled entirely.
+/// * [`CompactPolicy::ModelDefault`] — if `LLMConfig::max_context_tokens` is
+///   set it is used; otherwise the client attempts discovery via
+///   [`OpenAIClient::discover_max_context_tokens`] (probing `/models` for
+///   fields such as `max_model_len`).
+/// * [`CompactPolicy::Override(n)`] — uses `n` directly, bypassing config and
+///   discovery. Useful for testing with a deliberately small window.
+///
+/// When a context window is known and the prompt tokens of any turn reach
+/// >= 75% of that window, a separate summarization request is issued. The
+/// > summarizer is instructed to produce a compact summary targeting roughly
+/// > 25% of the window. On success:
 ///
 /// * The summary is stored and will appear in subsequent prompts under the
-///   heading `## PREVIOUS SESSIONS SUMMARY`.
+///   `PREVIOUS SESSIONS SUMMARY` heading.
 /// * Old entries are dropped from the in-memory typed history (only the most
 ///   recent few turns are kept verbatim).
 ///
 /// Compaction is best-effort: if the summarization call fails, a warning is
-/// logged and the loop continues with the current history.
-///
-/// The compaction chat call itself does not count against `max_iterations`.
+/// logged and the loop continues with the current history. The compaction chat
+/// call itself does not count against `max_iterations`.
 ///
 /// # Arguments
 /// * `client` — The [`OpenAIClient`] to use.
 /// * `agent` — The agent implementing [`AgentLoop`].
-/// * `max_iterations` — Safety cap on the number of agent iterations.
-/// * `max_context_tokens` — Optional explicit window size. When `Some`, this
-///   overrides config and skips discovery. Pass a small value (e.g. 800) in
-///   tests to force compaction to be exercised.
+/// * `config` — A [`LoopConfig`] (or builder result) controlling iteration
+///   limits and compaction policy.
 ///
 /// # Returns
 /// The agent's final [`AgentLoop::Output`] on success.
 ///
 /// # Errors
 /// Returns an error if the LLM API fails, deserialization fails, or the
-/// iteration limit is exceeded.
-pub async fn run_loop_with_max_and_context<Agent: AgentLoop>(
+/// iteration limit is exceeded (when `max_iterations` is set).
+pub async fn run_loop<Agent: AgentLoop>(
     mut client: OpenAIClient,
     agent: Agent,
-    max_iterations: usize,
-    max_context_tokens: Option<usize>,
+    config: LoopConfig,
 ) -> anyhow::Result<Agent::Output> {
-    // Determine the effective max context window (in tokens).
-    let mut max_context: Option<usize> =
-        max_context_tokens.or_else(|| client.max_context_tokens());
+    let max_iterations = config.max_iterations;
+    let compact_policy = config.compact_policy;
 
-    if max_context.is_none() {
-        match client.discover_max_context_tokens().await {
-            Ok(Some(n)) => {
-                info!(target: "da_harness::loop", max_context_tokens = n, "discovered model context window");
-                max_context = Some(n);
-            }
-            Ok(None) => {
-                warn!(target: "da_harness::loop", "server did not report a context window for model; compaction disabled");
-            }
-            Err(e) => {
-                warn!(target: "da_harness::loop", error = %e, "context window discovery failed; compaction disabled");
+    // Determine the effective max context window (in tokens).
+    let max_context: Option<usize> = match compact_policy {
+        CompactPolicy::NoCompact => {
+            info!(target: "da_harness::loop", "compaction disabled by policy");
+            None
+        }
+        CompactPolicy::Override(n) => {
+            info!(target: "da_harness::loop", max_context_tokens = n, "using explicit max context (override)");
+            Some(n)
+        }
+        CompactPolicy::ModelDefault => {
+            if let Some(n) = client.max_context_tokens() {
+                info!(target: "da_harness::loop", max_context_tokens = n, "using configured max context from LLMConfig");
+                Some(n)
+            } else {
+                match client.discover_max_context_tokens().await {
+                    Ok(Some(n)) => {
+                        info!(target: "da_harness::loop", max_context_tokens = n, "discovered model context window");
+                        Some(n)
+                    }
+                    Ok(None) => {
+                        warn!(target: "da_harness::loop", "server did not report a context window for model; compaction disabled");
+                        None
+                    }
+                    Err(e) => {
+                        warn!(target: "da_harness::loop", error = %e, "context window discovery failed; compaction disabled");
+                        None
+                    }
+                }
             }
         }
-    } else if max_context_tokens.is_some() && let Some(c) = max_context {
-        info!(target: "da_harness::loop", max_context_tokens = c, "using explicit max context (override)");
-    }
+    };
 
-    if max_context.is_none() {
+    if max_context.is_none() && compact_policy != CompactPolicy::NoCompact {
         warn!(target: "da_harness::loop", "no max context window known; compaction will not be triggered");
     }
+
+    // Determine iteration range.
+    let iter_limit = max_iterations.unwrap_or(usize::MAX);
 
     let mut history: Vec<(Agent::Request, Agent::Response)> = Vec::new();
     let mut current_request = agent.initial_input();
@@ -567,7 +604,7 @@ pub async fn run_loop_with_max_and_context<Agent: AgentLoop>(
 
     info!(target: "da_harness::loop", system = %agent.system_prompt(), "starting agent loop");
 
-    for iteration in 0..max_iterations {
+    for iteration in 0..iter_limit {
         let user_message =
             build_user_prompt(&agent, &history, &current_request, previous_summary.as_deref());
 
@@ -656,7 +693,11 @@ pub async fn run_loop_with_max_and_context<Agent: AgentLoop>(
         }
     }
 
-    anyhow::bail!("too many iterations (max {})", max_iterations)
+    if let Some(limit) = max_iterations {
+        anyhow::bail!("too many iterations (max {})", limit)
+    } else {
+        anyhow::bail!("agent loop did not terminate; consider setting max_iterations")
+    }
 }
 
 /// Builds a combined JSON schema containing both the `Request` and `Response`
@@ -786,7 +827,7 @@ fn extract_json(text: &str) -> &str {
         if rest.len() >= 4 {
             let prefix = &rest[..4].to_ascii_lowercase();
             if prefix == "json" || prefix.starts_with("json") {
-                rest = &rest[4..].trim_start();
+                rest = rest[4..].trim_start();
             }
         }
         if let Some(end) = rest.find("```") {

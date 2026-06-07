@@ -29,7 +29,7 @@ da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.1" }
 Define your agent by implementing the `AgentLoop` trait:
 
 ```rust
-use da_harness::{AgentLoop, LoopControl, OpenAIClient, run_loop};
+use da_harness::{AgentLoop, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -88,8 +88,9 @@ impl AgentLoop for MyAgent {
 
 #[tokio::main]
 async fn main() {
+    let config = LoopConfigBuilder::default().try_build().unwrap();
     let client = OpenAIClient::new();
-    let output = run_loop(client, MyAgent).await.unwrap();
+    let output = run_loop(client, MyAgent, config).await.unwrap();
     println!("Result: {}", output);
 }
 ```
@@ -113,7 +114,7 @@ async fn main() {
    - `LoopControl::Continue(next_request)` — executes your controller logic and feeds the result back as the next iteration's input.
    - `LoopControl::Stop(output)` — ends the loop and returns the final output value.
 
-The default maximum iteration count is 10. Use `run_loop_with_max` (or `run_loop_with_max_and_context`) to customize the iteration limit. When a maximum context window size is known (via `LLMConfig`, an explicit parameter, or by querying the server's `/models` endpoint), the loop will automatically trigger history compaction once ~75% of the window has been used, asking the LLM to produce a compact "previous sessions summary" targeting ~25% of the window and truncating the retained typed history.
+By default there is no iteration cap (the loop runs until the agent returns `Stop`). Use [`LoopConfigBuilder`] to set an optional `max_iterations` limit and a [`CompactPolicy`] for compaction behavior. When a maximum context window size is known (via `LLMConfig`, a `CompactPolicy::Override`, or by querying the server's `/models` endpoint), the loop will automatically trigger history compaction once ~75% of the window has been used, asking the LLM to produce a compact "previous sessions summary" targeting ~25% of the window and truncating the retained typed history.
 
 ## Prompt Structure
 

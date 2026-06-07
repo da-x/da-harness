@@ -142,6 +142,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "derive_builder",
  "reqwest",
  "schemars",
  "serde",

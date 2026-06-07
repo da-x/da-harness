@@ -14,7 +14,9 @@
 //   cargo test --test compaction -- --nocapture
 
 use async_trait::async_trait;
-use da_harness::{AgentLoop, LLMConfig, LoopControl, OpenAIClient, run_loop_with_max_and_context};
+use da_harness::{
+    AgentLoop, CompactPolicy, LLMConfig, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -165,12 +167,16 @@ async fn compaction_forces_summary_and_truncation() {
     // in the observed run. 75% of 700 is 525, so compaction will trigger after
     // the first response (history will be rewritten with a "PREVIOUS SESSIONS SUMMARY"
     // and truncated). This exercises the full compaction machinery.
-    let tiny_context: Option<usize> = Some(900);
+    let config = LoopConfigBuilder::default()
+        .max_iterations(Some(30))
+        .compact_policy(CompactPolicy::Override(700))
+        .try_build()
+        .unwrap();
 
     // Target high enough to require multiple steps even after early compaction.
     let agent = CountAgent { target: 10 };
 
-    let final_count = run_loop_with_max_and_context(client, agent, 30, tiny_context)
+    let final_count = run_loop(client, agent, config)
         .await
         .expect("agent loop with forced compaction should succeed");
 

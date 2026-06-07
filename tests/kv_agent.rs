@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use da_harness::{AgentLoop, LLMConfig, LoopControl, OpenAIClient, run_loop};
+use da_harness::{AgentLoop, LLMConfig, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -156,7 +156,11 @@ async fn kv_read_modify_finish() {
         instruction: "Read the value under key 'target'. Compute twice that number as a string and store it under 'doubled'. Then Finish.".into(),
     };
 
-    let _output = run_loop(client, agent).await.expect("agent loop failed");
+    let config = LoopConfigBuilder::default()
+        .max_iterations(Some(10))
+        .try_build()
+        .unwrap();
+    let _output = run_loop(client, agent, config).await.expect("agent loop failed");
 
     // Verify the LLM performed the correct operations.
     let final_map = store.lock().unwrap();
