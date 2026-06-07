@@ -2,6 +2,12 @@
 name = "da-harness"
 version = "0.1.0"
 edition = "2024"
+description = "A framework for running LLM-driven agent loops with structured JSON request/response schemas"
+repository = "https://github.com/da-x/da-harness"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["llm", "agent", "openai", "schema", "loop"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 anyhow = "1"

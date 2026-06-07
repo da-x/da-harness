@@ -1,1 +1,6 @@
 /target
+/**/target
+/.cargo-ok
+/.idea/
+.vscode/
+*.rs.bk
