@@ -160,7 +160,7 @@ async fn kv_read_modify_finish() {
         .max_iterations(Some(10))
         .try_build()
         .unwrap();
-    let _output = run_loop(client, agent, config).await.expect("agent loop failed");
+    let (_agent, _output) = run_loop(client, agent, config).await.expect("agent loop failed");
 
     // Verify the LLM performed the correct operations.
     let final_map = store.lock().unwrap();

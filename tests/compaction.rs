@@ -176,7 +176,7 @@ async fn compaction_forces_summary_and_truncation() {
     // Target high enough to require multiple steps even after early compaction.
     let agent = CountAgent { target: 10 };
 
-    let final_count = run_loop(client, agent, config)
+    let (_agent, final_count) = run_loop(client, agent, config)
         .await
         .expect("agent loop with forced compaction should succeed");
 

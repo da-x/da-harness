@@ -397,6 +397,34 @@ pub enum CompactPolicy {
     Override(usize),
 }
 
+// ─── SavePoint ────────────────────────────────────────────────────────
+
+/// Indicates the type of checkpoint being saved by [`AgentLoop::save`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePoint {
+    /// Normal mid-loop save: the agent is continuing to the next iteration.
+    Continue,
+    /// The most recent iteration triggered compaction; history has been
+    /// truncated and a summary is now in effect.
+    Compacted,
+    /// Final save after the agent returned [`LoopControl::Stop`]. No further
+    /// iterations will occur.
+    Final,
+}
+
+/// State restored by [`AgentLoop::restore`] to resume an agent loop from a
+/// previously saved checkpoint.
+#[derive(Debug, Clone)]
+pub struct RestoreState<Request, Response> {
+    /// Conversation history at the time of the last save.
+    pub history: Vec<(Request, Response)>,
+    /// The request that was pending when the checkpoint was taken.
+    pub current_request: Request,
+    /// The "previous sessions summary" if compaction had occurred before the
+    /// checkpoint was saved.
+    pub previous_summary: Option<String>,
+}
+
 // ─── LoopConfig ───────────────────────────────────────────────────────
 
 /// Configuration for a single invocation of [`run_loop`].
@@ -504,6 +532,43 @@ pub trait AgentLoop: Sized {
         response: Self::Response,
         history: &[(Self::Request, Self::Response)],
     ) -> LoopControl<Self>;
+
+    /// Called once before the loop begins to allow the agent to restore
+    /// previously saved state.
+    ///
+    /// Return `Some((history, current_request, summary))` to resume from a
+    /// prior checkpoint. The returned history and request replace the initial
+    /// empty history and [`AgentLoop::initial_input`]. The optional summary
+    /// is injected as the "previous sessions summary" in subsequent prompts.
+    ///
+    /// Return `None` to start fresh with an empty history and the agent's
+    /// initial input. This is the default implementation.
+    async fn restore(&mut self) -> Option<RestoreState<Self::Request, Self::Response>> {
+        None
+    }
+
+    /// Called at the beginning of each iteration (starting from iteration 1)
+    /// and once more when the loop is about to stop, allowing the agent to
+    /// persist its current state.
+    ///
+    /// # Arguments
+    /// * `history` — The full conversation history up to the current point.
+    /// * `summary` — The current "previous sessions summary", if compaction
+    ///   has occurred.
+    /// * `current_request` — The request that will be (or was just) sent to
+    ///   the LLM in this iteration.
+    /// * `save_point` — Indicates the type of checkpoint being saved.
+    ///
+    /// The default implementation does nothing. Implementors are responsible
+    /// for all serialization and storage logic.
+    async fn save(
+        &mut self,
+        _history: &[(Self::Request, Self::Response)],
+        _summary: Option<&str>,
+        _current_request: &Self::Request,
+        _save_point: SavePoint,
+    ) {
+    }
 }
 
 // ─── run_loop ────────────────────────────────────────────────────────
@@ -545,16 +610,17 @@ pub trait AgentLoop: Sized {
 ///   limits and compaction policy.
 ///
 /// # Returns
-/// The agent's final [`AgentLoop::Output`] on success.
+/// A tuple of `(agent, output)` on success. The agent is returned so
+/// implementors can inspect its internal state after the loop completes.
 ///
 /// # Errors
 /// Returns an error if the LLM API fails, deserialization fails, or the
 /// iteration limit is exceeded (when `max_iterations` is set).
-pub async fn run_loop<Agent: AgentLoop>(
+pub async fn run_loop<Agent: AgentLoop + Send>(
     mut client: OpenAIClient,
-    agent: Agent,
+    mut agent: Agent,
     config: LoopConfig,
-) -> anyhow::Result<Agent::Output> {
+) -> anyhow::Result<(Agent, Agent::Output)> {
     let max_iterations = config.max_iterations;
     let compact_policy = config.compact_policy;
 
@@ -598,13 +664,31 @@ pub async fn run_loop<Agent: AgentLoop>(
     // Determine iteration range.
     let iter_limit = max_iterations.unwrap_or(usize::MAX);
 
-    let mut history: Vec<(Agent::Request, Agent::Response)> = Vec::new();
-    let mut current_request = agent.initial_input();
-    let mut previous_summary: Option<String> = None;
+    // Attempt to restore previously saved state.
+    let restored = agent.restore().await;
+    let (mut history, mut current_request, mut previous_summary) = match restored {
+        Some(state) => {
+            info!(target: "da_harness::loop", entries = state.history.len(), has_summary = state.previous_summary.is_some(), "restored saved state");
+            (state.history, state.current_request, state.previous_summary)
+        }
+        None => {
+            (Vec::new(), agent.initial_input(), None)
+        }
+    };
 
     info!(target: "da_harness::loop", system = %agent.system_prompt(), "starting agent loop");
 
+    // Tracks whether the most recent iteration triggered compaction.
+    let mut save_point = SavePoint::Continue;
+
     for iteration in 0..iter_limit {
+        // Persistence save hook (skip iteration 0, which is the initial state).
+        if iteration > 0 {
+            agent
+                .save(&history, previous_summary.as_deref(), &current_request, save_point)
+                .await;
+        }
+
         let user_message =
             build_user_prompt(&agent, &history, &current_request, previous_summary.as_deref());
 
@@ -640,6 +724,7 @@ pub async fn run_loop<Agent: AgentLoop>(
 
         match agent.iteration(response, &history).await {
             LoopControl::Continue(next_request) => {
+                save_point = SavePoint::Continue;
                 current_request = next_request;
 
                 // Check for compaction after each response when we know we will continue.
@@ -665,6 +750,7 @@ pub async fn run_loop<Agent: AgentLoop>(
                     {
                         Ok(summary) => {
                             previous_summary = Some(summary);
+                            save_point = SavePoint::Compacted;
                             // Truncate typed history: keep only the most recent few turns.
                             const KEEP_LAST: usize = 3;
                             let len = history.len();
@@ -688,7 +774,12 @@ pub async fn run_loop<Agent: AgentLoop>(
                 }
             }
             LoopControl::Stop(output) => {
-                return Ok(output);
+                if let Some((last_req, _)) = history.last() {
+                    agent
+                        .save(&history, previous_summary.as_deref(), last_req, SavePoint::Final)
+                        .await;
+                }
+                return Ok((agent, output));
             }
         }
     }
