@@ -261,7 +261,9 @@ impl OpenAIClient {
                 "context_window",
                 "max_tokens",
             ] {
-                if let Some(n) = entry.get(key).and_then(|v| v.as_u64()) && n > 0 {
+                if let Some(n) = entry.get(key).and_then(|v| v.as_u64())
+                    && n > 0
+                {
                     let n = n as usize;
                     self.max_context_tokens = Some(n);
                     return Ok(Some(n));
@@ -510,10 +512,7 @@ pub trait AgentLoop: Sized {
     ///
     /// This hook is useful for injecting dynamic instructions, constraints,
     /// or summaries as the conversation progresses.
-    fn extend_prompt(
-        &self,
-        _history: &[(Self::Request, Self::Response)],
-    ) -> Option<String> {
+    fn extend_prompt(&self, _history: &[(Self::Request, Self::Response)]) -> Option<String> {
         None
     }
 
@@ -671,9 +670,7 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
             info!(target: "da_harness::loop", entries = state.history.len(), has_summary = state.previous_summary.is_some(), "restored saved state");
             (state.history, state.current_request, state.previous_summary)
         }
-        None => {
-            (Vec::new(), agent.initial_input(), None)
-        }
+        None => (Vec::new(), agent.initial_input(), None),
     };
 
     info!(target: "da_harness::loop", system = %agent.system_prompt(), "starting agent loop");
@@ -685,12 +682,21 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
         // Persistence save hook (skip iteration 0, which is the initial state).
         if iteration > 0 {
             agent
-                .save(&history, previous_summary.as_deref(), &current_request, save_point)
+                .save(
+                    &history,
+                    previous_summary.as_deref(),
+                    &current_request,
+                    save_point,
+                )
                 .await;
         }
 
-        let user_message =
-            build_user_prompt(&agent, &history, &current_request, previous_summary.as_deref());
+        let user_message = build_user_prompt(
+            &agent,
+            &history,
+            &current_request,
+            previous_summary.as_deref(),
+        );
 
         info!(target: "da_harness::loop", iteration, prompt = %user_message, ">> sending to LLM");
 
@@ -715,8 +721,10 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
         info!(target: "da_harness::loop", iteration, reply = %response_text, used_prompt_tokens = ?prompt_tokens, "<< raw LLM reply");
 
         let json_text = extract_json(&response_text);
-        let response: Agent::Response = serde_json::from_str(json_text)
-            .context(format!("failed to deserialize LLM response: {}", response_text))?;
+        let response: Agent::Response = serde_json::from_str(json_text).context(format!(
+            "failed to deserialize LLM response: {}",
+            response_text
+        ))?;
 
         history.push((current_request, response.clone()));
 
@@ -776,7 +784,12 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
             LoopControl::Stop(output) => {
                 if let Some((last_req, _)) = history.last() {
                     agent
-                        .save(&history, previous_summary.as_deref(), last_req, SavePoint::Final)
+                        .save(
+                            &history,
+                            previous_summary.as_deref(),
+                            last_req,
+                            SavePoint::Final,
+                        )
                         .await;
                 }
                 return Ok((agent, output));
@@ -796,10 +809,8 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
 /// single `definitions` section.
 fn build_combined_schema<Agent: AgentLoop>() -> serde_json::Value {
     let mut schema_gen = SchemaGenerator::default();
-    let request_schema =
-        <Agent::Request as schemars::JsonSchema>::json_schema(&mut schema_gen);
-    let response_schema =
-        <Agent::Response as schemars::JsonSchema>::json_schema(&mut schema_gen);
+    let request_schema = <Agent::Request as schemars::JsonSchema>::json_schema(&mut schema_gen);
+    let response_schema = <Agent::Response as schemars::JsonSchema>::json_schema(&mut schema_gen);
 
     let definitions = schema_gen.take_definitions();
 
@@ -811,8 +822,14 @@ fn build_combined_schema<Agent: AgentLoop>() -> serde_json::Value {
             serde_json::to_value(definitions).unwrap(),
         );
     }
-    schema_obj.insert("Request".into(), serde_json::to_value(request_schema).unwrap());
-    schema_obj.insert("Response".into(), serde_json::to_value(response_schema).unwrap());
+    schema_obj.insert(
+        "Request".into(),
+        serde_json::to_value(request_schema).unwrap(),
+    );
+    schema_obj.insert(
+        "Response".into(),
+        serde_json::to_value(response_schema).unwrap(),
+    );
 
     serde_json::Value::Object(schema_obj)
 }
@@ -961,7 +978,12 @@ async fn compact_conversation<Agent: AgentLoop>(
     for (i, (req, resp)) in history.iter().enumerate() {
         let rj = serde_json::to_string(req).unwrap_or_default();
         let sj = serde_json::to_string(resp).unwrap_or_default();
-        user.push_str(&format!("Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n", i + 1, rj, sj));
+        user.push_str(&format!(
+            "Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n",
+            i + 1,
+            rj,
+            sj
+        ));
     }
 
     user.push_str(&format!(
@@ -1006,7 +1028,12 @@ async fn compact_conversation<Agent: AgentLoop>(
         for (i, (req, resp)) in history.iter().enumerate() {
             let rj = serde_json::to_string(req).unwrap_or_default();
             let sj = serde_json::to_string(resp).unwrap_or_default();
-            stricter.push_str(&format!("Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n", i + 1, rj, sj));
+            stricter.push_str(&format!(
+                "Turn {}:\nINPUT: {}\nOUTPUT: {}\n\n",
+                i + 1,
+                rj,
+                sj
+            ));
         }
         stricter.push_str(
             "The previous summary was too long. Produce a MUCH shorter version that still \
@@ -1060,10 +1087,8 @@ mod tests {
     #[test]
     fn test_shared_type_deduplicated() {
         let mut schema_gen = SchemaGenerator::default();
-        let request_schema =
-            <TestRequest as schemars::JsonSchema>::json_schema(&mut schema_gen);
-        let response_schema =
-            <TestResponse as schemars::JsonSchema>::json_schema(&mut schema_gen);
+        let request_schema = <TestRequest as schemars::JsonSchema>::json_schema(&mut schema_gen);
+        let response_schema = <TestResponse as schemars::JsonSchema>::json_schema(&mut schema_gen);
 
         let definitions = schema_gen.take_definitions();
 
@@ -1079,8 +1104,14 @@ mod tests {
                 serde_json::to_value(&definitions).unwrap(),
             );
         }
-        schema_obj.insert("Request".into(), serde_json::to_value(&request_schema).unwrap());
-        schema_obj.insert("Response".into(), serde_json::to_value(&response_schema).unwrap());
+        schema_obj.insert(
+            "Request".into(),
+            serde_json::to_value(&request_schema).unwrap(),
+        );
+        schema_obj.insert(
+            "Response".into(),
+            serde_json::to_value(&response_schema).unwrap(),
+        );
 
         let combined = serde_json::Value::Object(schema_obj.clone());
         let json = serde_json::to_string_pretty(&combined).unwrap();

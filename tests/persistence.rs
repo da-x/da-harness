@@ -96,21 +96,30 @@ impl AgentLoop for CountPersistAgent {
     fn examples(&self) -> Vec<(Self::Request, Self::Response)> {
         vec![
             (
-                CountRequest { current: 0, target: 2 },
+                CountRequest {
+                    current: 0,
+                    target: 2,
+                },
                 CountResponse {
                     increment: true,
                     done: false,
                 },
             ),
             (
-                CountRequest { current: 1, target: 2 },
+                CountRequest {
+                    current: 1,
+                    target: 2,
+                },
                 CountResponse {
                     increment: true,
                     done: false,
                 },
             ),
             (
-                CountRequest { current: 2, target: 2 },
+                CountRequest {
+                    current: 2,
+                    target: 2,
+                },
                 CountResponse {
                     increment: false,
                     done: true,
@@ -219,7 +228,9 @@ async fn persistence_hooks_fire_correctly() {
         .try_build()
         .unwrap();
 
-    let (agent, output) = run_loop(client, agent, config).await.expect("agent loop failed");
+    let (agent, output) = run_loop(client, agent, config)
+        .await
+        .expect("agent loop failed");
     assert_eq!(output, 3, "expected counter to reach target 3");
 
     let final_state = &agent.state;
@@ -272,21 +283,30 @@ async fn restore_from_middle_state() {
     let restore_payload = RestoreState {
         history: vec![
             (
-                CountRequest { current: 0, target: 3 },
+                CountRequest {
+                    current: 0,
+                    target: 3,
+                },
                 CountResponse {
                     increment: true,
                     done: false,
                 },
             ),
             (
-                CountRequest { current: 1, target: 3 },
+                CountRequest {
+                    current: 1,
+                    target: 3,
+                },
                 CountResponse {
                     increment: true,
                     done: false,
                 },
             ),
         ],
-        current_request: CountRequest { current: 2, target: 3 },
+        current_request: CountRequest {
+            current: 2,
+            target: 3,
+        },
         previous_summary: Some("Counter was incremented from 0 to 2. Target is 3.".to_string()),
     };
 
@@ -304,8 +324,13 @@ async fn restore_from_middle_state() {
         .try_build()
         .unwrap();
 
-    let (agent, output) = run_loop(client, agent, config).await.expect("agent loop failed");
-    assert_eq!(output, 3, "expected counter to reach target 3 from restored state");
+    let (agent, output) = run_loop(client, agent, config)
+        .await
+        .expect("agent loop failed");
+    assert_eq!(
+        output, 3,
+        "expected counter to reach target 3 from restored state"
+    );
 
     let final_state = &agent.state;
 
@@ -322,12 +347,18 @@ async fn restore_from_middle_state() {
 
     // Save #1 (iter 1, Continue): history has 3 entries, summary present.
     assert_eq!(saves[0].history_len, 3);
-    assert!(saves[0].has_summary, "expected the restored summary to be present");
+    assert!(
+        saves[0].has_summary,
+        "expected the restored summary to be present"
+    );
     assert_eq!(saves[0].current, 3);
     assert_eq!(saves[0].save_point, SavePoint::Continue);
 
     // Save #2 (Final): history has 4 entries.
     assert_eq!(saves[1].history_len, 4);
-    assert!(saves[1].has_summary, "expected the restored summary to still be present");
+    assert!(
+        saves[1].has_summary,
+        "expected the restored summary to still be present"
+    );
     assert_eq!(saves[1].save_point, SavePoint::Final);
 }
