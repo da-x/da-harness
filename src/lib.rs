@@ -6,6 +6,14 @@
 pub mod multi_tool;
 pub mod single_tool;
 
+// Re-export types needed by callers constructing user messages and tool schemas.
+pub use async_openai::types::{
+    ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart,
+};
+pub use schemars;
+
 use anyhow::Context;
 use async_openai::{
     Client,

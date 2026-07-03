@@ -14,20 +14,21 @@ use tracing::{debug, info};
 use crate::{OpenAIClient, generate_tool_schema};
 
 pub type TaskFuture = BoxFuture<'static, anyhow::Result<()>>;
+pub type TaskFutureStr = BoxFuture<'static, anyhow::Result<String>>;
 
 #[derive(Clone)]
 pub struct Tool {
-    handler: Arc<dyn Fn(serde_json::Value) -> TaskFuture + Send + Sync>,
+    handler: Arc<dyn Fn(serde_json::Value) -> TaskFutureStr + Send + Sync>,
     description: ChatCompletionTool,
 }
 
 impl Tool {
-    pub fn new<T>(callback: Arc<dyn Fn(T) -> TaskFuture + Send + Sync>) -> anyhow::Result<Self>
+    pub fn new<T>(callback: Arc<dyn Fn(T) -> TaskFutureStr + Send + Sync>) -> anyhow::Result<Self>
     where
         T: for<'de> Deserialize<'de> + Clone + schemars::JsonSchema + 'static,
     {
         let callback = callback;
-        let handler: Arc<dyn Fn(serde_json::Value) -> TaskFuture + Send + Sync> =
+        let handler: Arc<dyn Fn(serde_json::Value) -> TaskFutureStr + Send + Sync> =
             Arc::new(move |value: serde_json::Value| {
                 let cb = callback.clone();
                 Box::pin(async move {
@@ -231,8 +232,8 @@ impl AgentInvocation {
 
             let parsed: serde_json::Value =
                 serde_json::from_str(&args).context("failed to parse tool arguments")?;
-            (tool.handler)(parsed).await?;
-            Ok("OK".to_string())
+            let res = (tool.handler)(parsed).await?;
+            Ok(res)
         })
     }
 }

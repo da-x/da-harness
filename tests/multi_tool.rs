@@ -5,7 +5,6 @@ use da_harness::multi_tool::{AgentInvocation, TaskFuture, Tool};
 use da_harness::{LLMConfig, OpenAIClient};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tracing::info;
 
 /// Adds the given value to the running counter.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -49,12 +48,12 @@ async fn multi_tool_count_to_target() {
     let counter = Arc::new(Mutex::new(0u32));
 
     let counter_add = counter.clone();
-    let add_tool = Tool::new(Arc::new(move |args: Add| -> TaskFuture {
+    let add_tool = Tool::new(Arc::new(move |args: Add| {
         let c = counter_add.clone();
         Box::pin(async move {
             let mut val = c.lock().unwrap();
             *val += args.value;
-            Ok(())
+            Ok("OK".to_owned())
         })
     }))
     .unwrap();
@@ -64,14 +63,14 @@ async fn multi_tool_count_to_target() {
 
     let counter_stop = counter.clone();
     let stop_tx_inner = stop_tx.clone();
-    let stop_tool = Tool::new(Arc::new(move |args: Stop| -> TaskFuture {
+    let stop_tool = Tool::new(Arc::new(move |args: Stop| {
         let c = counter_stop.clone();
         let stx = stop_tx_inner.clone();
         Box::pin(async move {
             let val = *c.lock().unwrap();
             tracing::info!(counter = val, requested = args.result, "Stop tool called");
             let _ = stx.send(()).await;
-            Ok(())
+            Ok("OK".to_owned())
         })
     }))
     .unwrap();
