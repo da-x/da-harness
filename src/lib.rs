@@ -98,7 +98,8 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionTool, CreateChatCompletionRequestArgs,
+        FunctionObjectArgs,
     },
 };
 use async_trait::async_trait;
@@ -1062,8 +1063,64 @@ async fn compact_conversation<Agent: AgentLoop>(
     Ok(summary.trim().to_string())
 }
 
+pub fn generate_tool_schema<T>() -> anyhow::Result<ChatCompletionTool>
+where
+    T: schemars::JsonSchema,
+{
+    let mut schema_gen = SchemaGenerator::default();
+    let schema = <T as schemars::JsonSchema>::json_schema(&mut schema_gen);
+    let definitions = schema_gen.take_definitions();
+
+    let mut schema_obj = serde_json::to_value(&schema)?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    if !definitions.is_empty() {
+        schema_obj.insert("definitions".into(), serde_json::to_value(&definitions)?);
+    }
+
+    // Remove metadata that's already represented at the function level
+    schema_obj.remove("description");
+    schema_obj.remove("title");
+
+    // Add $schema from schemars settings
+    if let Some(schema_url) = schema_gen.settings().meta_schema.clone() {
+        schema_obj.insert("$schema".into(), serde_json::Value::String(schema_url));
+    }
+
+    let type_name = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let description = match &schema {
+        schemars::schema::Schema::Object(obj) => {
+            obj.metadata.as_ref().and_then(|m| m.description.clone())
+        }
+        _ => None,
+    };
+
+    let mut func_args = FunctionObjectArgs::default();
+    func_args.name(type_name);
+    if let Some(desc) = description {
+        func_args.description(desc);
+    }
+    func_args.parameters(serde_json::Value::Object(schema_obj));
+
+    let tool = ChatCompletionTool {
+        r#type: async_openai::types::ChatCompletionToolType::Function,
+        function: func_args.build().context("building tool schema")?,
+    };
+
+    Ok(tool)
+}
+
 #[cfg(test)]
 mod tests {
+    use schemars::JsonSchema;
+
     use super::*;
 
     #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1082,6 +1139,23 @@ mod tests {
     struct TestResponse {
         action: SharedAction,
         result: String,
+    }
+
+    #[test]
+    fn test_tool_schema() {
+        /// Looks up the current weather for a given location.
+        #[derive(JsonSchema, Clone)]
+        pub struct GetWeather {
+            /// The city and country, e.g. "London, UK" or "Tokyo, Japan".
+            pub location: String,
+            /// The temperature unit to use: "celsius" or "fahrenheit".
+            pub unit: String,
+        }
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&generate_tool_schema::<GetWeather>().unwrap()).unwrap()
+        );
     }
 
     #[test]
