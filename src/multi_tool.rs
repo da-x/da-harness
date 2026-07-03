@@ -4,7 +4,8 @@ use anyhow::Context;
 use async_openai::types::{
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionTool,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    ChatCompletionTool,
 };
 use futures::future::BoxFuture;
 use serde::Deserialize;
@@ -57,7 +58,7 @@ pub struct AgentInvocation {
 
     // Incoming user messages. Implementation will try_read from this between
     // LLM invocations. If closed, the loop ends.
-    pub incoming: tokio::sync::mpsc::Receiver<String>,
+    pub incoming: tokio::sync::mpsc::Receiver<ChatCompletionRequestUserMessageContent>,
 
     // Called when agent wants to say something
     pub agent_message_callback: Arc<dyn Fn(String) -> TaskFuture + Send + Sync>,
@@ -93,10 +94,11 @@ impl AgentInvocation {
             // Drain any available user messages from the incoming channel.
             let mut added = 0;
             while let Ok(msg) = self.incoming.try_recv() {
-                debug!(target: "da_harness::multi_tool", msg = %msg, "<< user message received");
+                let s = serde_json::to_string(&msg)?;
+                debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
                 messages.push(
                     ChatCompletionRequestUserMessageArgs::default()
-                        .content(msg.as_str())
+                        .content(msg)
                         .build()
                         .context("building user message")?
                         .into(),
@@ -113,10 +115,11 @@ impl AgentInvocation {
                 (self.agent_idle_callback)().await?;
 
                 if let Some(msg) = self.incoming.recv().await {
-                    debug!(target: "da_harness::multi_tool", msg = %msg, "<< user message received");
+                    let s = serde_json::to_string(&msg)?;
+                    debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
                     messages.push(
                         ChatCompletionRequestUserMessageArgs::default()
-                            .content(msg.as_str())
+                            .content(msg)
                             .build()
                             .context("building user message")?
                             .into(),
