@@ -21,10 +21,8 @@
 use std::collections::VecDeque;
 
 use async_trait::async_trait;
-use da_harness::{
-    AgentLoop, LLMConfig, LoopConfigBuilder, LoopControl, OpenAIClient, RestoreState, SavePoint,
-    run_loop,
-};
+use da_harness::single_tool::{AgentLoop, LoopConfigBuilder, LoopControl, RestoreState, SavePoint, run_loop};
+use da_harness::{LLMConfig, OpenAIClient};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;

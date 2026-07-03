@@ -30,7 +30,8 @@ da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.2" }
 Define your agent by implementing the `AgentLoop` trait:
 
 ```rust
-use da_harness::{AgentLoop, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop};
+use da_harness::single_tool::{AgentLoop, LoopConfigBuilder, LoopControl, run_loop};
+use da_harness::OpenAIClient;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

@@ -14,9 +14,8 @@
 //   cargo test --test compaction -- --nocapture
 
 use async_trait::async_trait;
-use da_harness::{
-    AgentLoop, CompactPolicy, LLMConfig, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop,
-};
+use da_harness::single_tool::{AgentLoop, CompactPolicy, LoopConfigBuilder, LoopControl, run_loop};
+use da_harness::{LLMConfig, OpenAIClient};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;

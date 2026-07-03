@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use da_harness::{AgentLoop, LLMConfig, LoopConfigBuilder, LoopControl, OpenAIClient, run_loop};
+use da_harness::single_tool::{AgentLoop, LoopConfigBuilder, LoopControl, run_loop};
+use da_harness::{LLMConfig, OpenAIClient};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::info;
