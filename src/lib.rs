@@ -12,7 +12,8 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
+        ChatCompletionTool, CreateChatCompletionRequestArgs,
     },
 };
 use tracing::warn;
@@ -230,6 +231,30 @@ impl OpenAIClient {
         Ok((text, prompt_tokens))
     }
 
+    /// Sends a chat completion request with tools and returns the full response
+    /// message (including `tool_calls`) along with prompt token usage.
+    pub async fn chat_with_tools(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: Vec<ChatCompletionTool>,
+        parallel_tool_calls: bool,
+        temperature: f32,
+    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<u32>)> {
+        let mut request = CreateChatCompletionRequestArgs::default()
+            .model(self.model_name())
+            .messages(messages)
+            .temperature(temperature)
+            .tools(tools)
+            .build()?;
+
+        request.parallel_tool_calls = Some(parallel_tool_calls);
+
+        let response = self.client.chat().create(request).await?;
+
+        let prompt_tokens = response.usage.map(|u| u.prompt_tokens);
+        Ok((response.choices[0].message.clone(), prompt_tokens))
+    }
+
     /// Checks whether the LLM endpoint is reachable by sending a minimal
     /// chat completion request.
     ///
@@ -281,7 +306,7 @@ impl OpenAIClient {
     }
 }
 
-use async_openai::types::{ChatCompletionTool, FunctionObjectArgs};
+use async_openai::types::FunctionObjectArgs;
 use schemars::r#gen::SchemaGenerator;
 
 /// Extracts the JSON content from an LLM reply that may be wrapped in
