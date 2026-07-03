@@ -3,6 +3,7 @@
 //! A framework for running LLM-driven agent loops with structured JSON
 //! request/response schemas.
 
+pub mod multi_tool;
 pub mod single_tool;
 
 use anyhow::Context;
