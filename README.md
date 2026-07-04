@@ -28,7 +28,7 @@ Add `da-harness` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.2" }
+da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.3" }
 ```
 
 ### Multi-Tool Agent
