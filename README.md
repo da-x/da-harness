@@ -173,7 +173,7 @@ The `single_tool` module works well for agents with a single structured request/
 ### Example
 
 ```rust
-use da_harness::multi_tool::{Tool, AgentInvocation};
+use da_harness::multi_tool::{Tool, AgentInvocationArgs};
 use da_harness::OpenAIClient;
 use serde::Deserialize;
 use schemars::JsonSchema;
@@ -192,20 +192,21 @@ let calc_tool = Tool::new::<CalcArgs>(Arc::new(|args| {
 }))?;
 
 let (tx, rx) = tokio::sync::mpsc::channel(32);
-let invocation = AgentInvocation {
-    system_prompt: "You are a helpful assistant with access to tools.".into(),
-    tools: vec![calc_tool],
-    parallel_tools: true,
-    incoming: rx,
-    agent_message_callback: Arc::new(|msg| Box::pin(async move {
-        println!("Agent: {}", msg);
+let invocation = AgentInvocationArgs::default()
+    .system_prompt("You are a helpful assistant with access to tools.")
+    .tools(vec![calc_tool])
+    .parallel_tools(true)
+    .incoming(rx)
+    .agent_message_callback(|msg| Box::pin(async move {
+        println!("Agent message to user: {}", msg);
         Ok(())
-    })),
-    agent_idle_callback: Arc::new(|| Box::pin(async move {
+    }))
+    .agent_idle_callback(|| Box::pin(async move {
         println!("Agent is awaiting response from user");
         Ok(())
-    })),
-};
+    }))
+    .build()
+    .unwrap();
 
 invocation.run(client).await?;
 ```

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_openai::types::ChatCompletionRequestUserMessageContent;
-use da_harness::multi_tool::{AgentInvocation, TaskFuture, Tool};
+use da_harness::multi_tool::{AgentInvocationArgs, TaskFuture, Tool};
 use da_harness::{LLMConfig, OpenAIClient};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -77,29 +77,29 @@ async fn multi_tool_count_to_target() {
 
     let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-    let invocation = AgentInvocation {
-        system_prompt: "You are a counter agent. You have two tools:\n\
+    let invocation = AgentInvocationArgs::default()
+        .system_prompt("You are a counter agent. You have two tools:\n\
                        - Add(value): adds a value to the counter.\n\
                        - Stop(result): stops with the final result.\n\
                        Count from 0 to 5 by calling Add(1) five times, then call Stop(result=5).\n\
-                       You MUST call Stop after exactly 5 Add calls. Do not keep calling Add indefinitely."
-            .to_string(),
-        tools: vec![add_tool, stop_tool],
-        parallel_tools: false,
-        incoming: rx,
-        agent_message_callback: Arc::new(|msg: String| {
+                       You MUST call Stop after exactly 5 Add calls. Do not keep calling Add indefinitely.")
+        .tools(vec![add_tool, stop_tool])
+        .parallel_tools(false)
+        .incoming(rx)
+        .agent_message_callback(|msg: String| {
             Box::pin(async move {
                 tracing::info!(msg = %msg, "agent said");
                 Ok(())
             }) as TaskFuture
-        }),
-        agent_idle_callback: Arc::new(|| {
+        })
+        .agent_idle_callback(|| {
             Box::pin(async move {
                 tracing::info!("agent idle");
                 Ok(())
             }) as TaskFuture
-        }),
-    };
+        })
+        .build()
+        .unwrap();
 
     // Spawn the runner.
     let run_handle = tokio::spawn(invocation.run(client));
