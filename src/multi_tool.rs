@@ -145,22 +145,28 @@ impl AgentInvocation {
                 }
             };
 
+            let mut asst_builder = ChatCompletionRequestAssistantMessageArgs::default();
+            if let Some(tool_calls) = &response.tool_calls {
+                asst_builder.tool_calls(tool_calls.clone());
+                prev_call = true;
+            } else {
+                prev_call = false;
+            };
+
+            if let Some(ref content) = response.content {
+                info!(target: "da_harness::multi_tool", reply = %content, "<< LLM text response");
+                asst_builder.content(content.as_str());
+            }
+            if let Some(ref c) = response.refusal {
+                asst_builder.refusal(c.as_str());
+            }
+
             if let Some(tool_calls) = &response.tool_calls {
                 info!(
                     target: "da_harness::multi_tool",
                     n_tools = tool_calls.len(),
                     "<< LLM requested tool calls"
                 );
-
-                let mut asst_builder = ChatCompletionRequestAssistantMessageArgs::default();
-                asst_builder.tool_calls(tool_calls.clone());
-                if let Some(ref c) = response.content {
-                    asst_builder.content(c.as_str());
-                }
-                let assistant_msg: ChatCompletionRequestMessage = asst_builder
-                    .build()
-                    .context("building assistant message")?
-                    .into();
 
                 for tc in tool_calls {
                     let desc = serde_json::to_string(&tc.function)?;
@@ -204,26 +210,6 @@ impl AgentInvocation {
                         );
                     }
                 }
-
-                messages.push(assistant_msg);
-                prev_call = true;
-            } else {
-                prev_call = false;
-                let content = response.content.unwrap_or_default();
-                info!(target: "da_harness::multi_tool", reply = %content, "<< LLM text response");
-
-                let mut asst_builder = ChatCompletionRequestAssistantMessageArgs::default();
-                if !content.is_empty() {
-                    let _ = (self.agent_message_callback)(content.clone()).await;
-                    asst_builder.content(content.as_str());
-                }
-
-                messages.push(
-                    asst_builder
-                        .build()
-                        .context("building assistant message")?
-                        .into(),
-                );
             }
         }
 
