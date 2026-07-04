@@ -89,19 +89,25 @@ async fn multi_tool_count_to_target() {
         .tools(vec![add_tool, stop_tool])
         .parallel_tools(false)
         .incoming(rx)
-        .agent_message_callback(|msg: String| {
-            async move {
-                tracing::info!(msg = %msg, "agent said");
-                Ok(())
-            }
-            .boxed()
+        .agent_message_callback({
+            let cb: Arc<dyn Fn(String) -> TaskFuture + Send + Sync> = Arc::new(|msg: String| {
+                async move {
+                    tracing::info!(msg = %msg, "agent said");
+                    Ok(())
+                }
+                .boxed()
+            });
+            cb
         })
-        .agent_idle_callback(|| {
-            async move {
-                tracing::info!("agent idle");
-                Ok(())
-            }
-            .boxed()
+        .agent_idle_callback({
+            let cb: Arc<dyn Fn() -> TaskFuture + Send + Sync> = Arc::new(|| {
+                async move {
+                    tracing::info!("agent idle");
+                    Ok(())
+                }
+                .boxed()
+            });
+            cb
         })
         .build()
         .unwrap();
