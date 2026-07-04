@@ -150,6 +150,82 @@ let config = LoopConfigBuilder::default()
     .unwrap();
 ```
 
+## Multi-Tool Agents
+
+The `single_tool` module works well for agents with a single structured request/response cycle. For more complex scenarios where an agent needs to invoke multiple named functions (tools), use the `multi_tool` module instead.
+
+### Key Differences
+
+| `single_tool` | `multi_tool` |
+|---|---|
+| Single typed request/response loop | Open-ended tool-calling loop |
+| Agent returns `LoopControl::Continue` or `Stop` | Agent drives itself via tool calls and text responses |
+| Conversation history managed by the framework | User messages injected via async channel |
+| Schemas from `Request`/`Response` types | Tool schemas auto-generated from argument types |
+
+### How It Works
+
+1. Define tools using `Tool::new()`, each with a typed argument struct and an async handler.
+2. Build an `AgentInvocation` with your system prompt, tool list, and an incoming message channel.
+3. Call `run()` — the loop runs until the incoming channel is closed.
+4. The LLM decides whether to call tools or produce a text response. Tool calls are resolved by your handlers, and results are fed back to the LLM.
+
+### Example
+
+```rust
+use da_harness::multi_tool::{Tool, AgentInvocation};
+use da_harness::OpenAIClient;
+use serde::Deserialize;
+use schemars::JsonSchema;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct CalcArgs {
+    expression: String,
+}
+
+let calc_tool = Tool::new::<CalcArgs>(Arc::new(|args| {
+    let expr = args.expression;
+    Box::pin(async move {
+        let result = eval(&expr)?;
+        Ok(format!("Result: {}", result))
+    })
+}))?;
+
+let (tx, rx) = tokio::sync::mpsc::channel(32);
+let invocation = AgentInvocation {
+    system_prompt: "You are a helpful assistant with access to tools.".into(),
+    tools: vec![calc_tool],
+    parallel_tools: true,
+    incoming: rx,
+    agent_message_callback: Arc::new(|msg| Box::pin(async move {
+        println!("Agent: {}", msg);
+        Ok(())
+    })),
+    agent_idle_callback: Arc::new(|| Box::pin(async move {
+        println!("Agent is awaiting response from user");
+        Ok(())
+    })),
+};
+
+invocation.run(client).await?;
+```
+
+### Tool Execution
+
+When the LLM requests multiple tool calls, they can be executed in two modes:
+
+- **Parallel** (`parallel_tools: true`) — All tool calls run concurrently via `futures::join_all`. Results are collected and returned to the LLM together.
+- **Serial** (`parallel_tools: false`) — Tool calls execute one at a time, in order. Each result is appended before the next call runs.
+
+If a tool handler returns an error, the error message is still relayed to the LLM so it can recover.
+
+### Callbacks
+
+| Callback | When Called |
+|---|---|
+| `agent_message_callback` | The LLM produces a text response (no tool calls) |
+| `agent_idle_callback` | No pending user messages and no prior tool call — the agent is waiting for input |
+
 ## Prompt Structure
 
 Each iteration sends a prompt with these sections:

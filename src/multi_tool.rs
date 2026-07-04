@@ -7,7 +7,7 @@ use async_openai::types::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
     ChatCompletionTool,
 };
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use serde::Deserialize;
 use tracing::{debug, info};
 
@@ -31,10 +31,8 @@ impl Tool {
         let handler: Arc<dyn Fn(serde_json::Value) -> TaskFutureStr + Send + Sync> =
             Arc::new(move |value: serde_json::Value| {
                 let cb = callback.clone();
-                Box::pin(async move {
-                    let args: T = serde_json::from_value(value).expect("valid tool args");
-                    cb(args).await
-                })
+                async move { cb(serde_json::from_value(value).expect("valid tool args")).await }
+                    .boxed()
             });
 
         let description = generate_tool_schema::<T>()?;
@@ -224,7 +222,7 @@ impl AgentInvocation {
         let name = tool_call.function.name.clone();
         let args = tool_call.function.arguments.clone();
 
-        Box::pin(async move {
+        async move {
             let tool = tools
                 .iter()
                 .find(|t| t.description.function.name.as_str() == name)
@@ -234,6 +232,7 @@ impl AgentInvocation {
                 serde_json::from_str(&args).context("failed to parse tool arguments")?;
             let res = (tool.handler)(parsed).await?;
             Ok(res)
-        })
+        }
+        .boxed()
     }
 }
