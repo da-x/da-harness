@@ -425,6 +425,7 @@ mod tests {
     #[test]
     fn test_tool_schema() {
         /// Looks up the current weather for a given location.
+        #[allow(dead_code)]
         #[derive(JsonSchema, Clone)]
         pub struct GetWeather {
             /// The city and country, e.g. "London, UK" or "Tokyo, Japan".
