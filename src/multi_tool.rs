@@ -16,6 +16,14 @@ use crate::{OpenAIClient, generate_tool_schema};
 pub type TaskFuture = BoxFuture<'static, anyhow::Result<()>>;
 pub type TaskFutureStr = BoxFuture<'static, anyhow::Result<String>>;
 
+fn default_message_callback() -> Arc<dyn Fn(String) -> TaskFuture + Send + Sync> {
+    Arc::new(|_: String| Box::pin(async move { Ok(()) }))
+}
+
+fn default_idle_callback() -> Arc<dyn Fn() -> TaskFuture + Send + Sync> {
+    Arc::new(|| Box::pin(async move { Ok(()) }))
+}
+
 #[derive(Clone)]
 pub struct Tool {
     handler: Arc<dyn Fn(serde_json::Value) -> TaskFutureStr + Send + Sync>,
@@ -44,25 +52,33 @@ impl Tool {
     }
 }
 
+#[derive(derive_builder::Builder)]
+#[builder(name = "AgentInvocationArgs")]
+#[builder(pattern = "owned")]
+#[builder(setter(into))]
 pub struct AgentInvocation {
     pub system_prompt: String,
 
-    // Tools he agent can invoke. We use the tool's function name to differentiate
-    // when the LLM tells us to execute something, and to invoke the correct handler
-    // as an async tasks. If we receive a `tool_calls` vector of multple items we
-    // issue the tasks in parallel and call `select!`, or call serially based o
-    // `parallel_tools`.
+    /// Tools the agent can invoke. The tool's function name is used to differentiate
+    /// when the LLM tells us to execute something, and to invoke the correct handler
+    /// as an async task. If we receive a `tool_calls` vector of multiple items we
+    /// issue the tasks in parallel or serially based on `parallel_tools`.
+    #[builder(default)]
     pub tools: Vec<Tool>,
+
+    #[builder(default = "false")]
     pub parallel_tools: bool,
 
-    // Incoming user messages. Implementation will try_read from this between
-    // LLM invocations. If closed, the loop ends.
+    /// Incoming user messages. The implementation will try_recv from this between
+    /// LLM invocations. If closed, the loop ends.
     pub incoming: tokio::sync::mpsc::Receiver<ChatCompletionRequestUserMessageContent>,
 
-    // Called when agent wants to say something
+    /// Called when agent produces a text response (no tool calls).
+    #[builder(default = "default_message_callback()")]
     pub agent_message_callback: Arc<dyn Fn(String) -> TaskFuture + Send + Sync>,
 
-    // Called when agent wants to say something
+    /// Called when the agent is idle, waiting for incoming user messages.
+    #[builder(default = "default_idle_callback()")]
     pub agent_idle_callback: Arc<dyn Fn() -> TaskFuture + Send + Sync>,
 }
 
