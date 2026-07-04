@@ -17,11 +17,11 @@ pub type TaskFuture = BoxFuture<'static, anyhow::Result<()>>;
 pub type TaskFutureStr = BoxFuture<'static, anyhow::Result<String>>;
 
 fn default_message_callback() -> Arc<dyn Fn(String) -> TaskFuture + Send + Sync> {
-    Arc::new(|_: String| Box::pin(async move { Ok(()) }))
+    Arc::new(|_: String| async move { Ok(()) }.boxed())
 }
 
 fn default_idle_callback() -> Arc<dyn Fn() -> TaskFuture + Send + Sync> {
-    Arc::new(|| Box::pin(async move { Ok(()) }))
+    Arc::new(|| async move { Ok(()) }.boxed())
 }
 
 #[derive(Clone)]

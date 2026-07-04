@@ -1,21 +1,25 @@
 # da-harness
 
-A framework for running LLM-driven agent loops with structured JSON request/response schemas.
+A framework for running LLM-driven agent loops with tool calling and structured JSON request/response schemas.
 
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 
 ## Overview
 
-`da-harness` provides a simple abstraction over OpenAI-compatible chat APIs to build agents that operate in iterative loops. Each iteration the agent sends a structured JSON response, your controller executes it, and feeds the result back as the next request. The loop continues until the agent signals completion.
+`da-harness` provides abstractions over OpenAI-compatible chat APIs to build agents that operate in iterative loops. It offers two patterns:
+
+- **Multi-tool agents** (`multi_tool`) — The LLM drives itself by calling named tools you define. User messages are injected via an async channel, and the agent decides when to call tools or respond with text.
+- **Typed request/response loops** (`single_tool`) — You define `Request`, `Response`, and `Output` types. Each iteration the agent returns structured JSON, your controller executes it, and feeds the result back as the next request.
 
 Key features:
 
-- **Typed agent contracts** — Define `Request`, `Response`, and `Output` types that are automatically serialized to/from JSON.
-- **Schema-aware prompts** — JSON schemas are generated from your types via `schemars` and embedded in prompts, with shared type definitions deduplicated.
-- **Few-shot examples** — Provide example request/response pairs that are formatted into the prompt automatically.
-- **Conversation history** — Full request/response history is included in each iteration so the LLM has context.
-- **Automatic context compaction** — When prompt usage approaches the model's context window, the loop automatically summarizes earlier turns and truncates history to keep prompts within budget.
-- **Extensible prompts** — Use `extend_prompt` to inject dynamic context based on conversation state.
+- **Tool calling** — Define tools with typed argument structs; schemas are auto-generated via `schemars`.
+- **Parallel or serial execution** — Multiple tool calls from a single LLM response run concurrently or in order.
+- **Typed agent contracts** — For `single_tool`, define `Request`, `Response`, and `Output` types automatically serialized to/from JSON.
+- **Schema-aware prompts** — JSON schemas are embedded in prompts with shared type definitions deduplicated.
+- **Few-shot examples** — Provide example request/response pairs formatted into the prompt automatically (`single_tool`).
+- **Conversation history** — Full history included each iteration so the LLM has context.
+- **Automatic context compaction** — When prompt usage approaches the model's context window, the loop automatically summarizes earlier turns and truncates history (`single_tool`).
 - **Health checking** — Built-in endpoint health checks and readiness polling for `OpenAIClient`.
 
 ## Quick Start
@@ -27,7 +31,60 @@ Add `da-harness` to your `Cargo.toml`:
 da-harness = { git = "https://github.com/da-x/da-harness", branch = "r/0.2" }
 ```
 
-Define your agent by implementing the `AgentLoop` trait:
+### Multi-Tool Agent
+
+Define tools with typed argument structs and an async handler, then build the agent with `AgentInvocationArgs`:
+
+```rust
+use std::sync::Arc;
+use da_harness::multi_tool::{Tool, AgentInvocationArgs};
+use da_harness::OpenAIClient;
+use serde::Deserialize;
+use schemars::JsonSchema;
+use futures::FutureExt;
+
+/// Doc about the tool
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct CalcArgs {
+    /// Doc the parameter
+    expression: String,
+}
+
+let calc_tool = Tool::new::<CalcArgs>(Arc::new(|args| {
+    let expr = args.expression;
+    async move {
+        let result = eval(&expr)?;
+        Ok(format!("Result: {}", result))
+    }.boxed()
+}))?;
+
+let (tx, rx) = tokio::sync::mpsc::channel(32);
+let invocation = AgentInvocationArgs::default()
+    .system_prompt("You are a helpful assistant with access to tools.")
+    .tools(vec![calc_tool])
+    .parallel_tools(true)
+    .incoming(rx)
+    .agent_message_callback(|msg| Box::pin(async move {
+        println!("Agent says: {}", msg);
+        Ok(())
+    }))
+    .agent_idle_callback(|| Box::pin(async move {
+        println!("Agent is idle awaiting user input");
+        Ok(())
+    }))
+    .build()
+    .unwrap();
+
+// tx close ends the session
+invocation.run(client).await?;
+```
+
+The loop runs until the incoming channel is closed. The LLM decides whether to call tools or produce a text response. Tool calls are resolved by your handlers, and results are fed back to the LLM.
+
+
+### Typed Request/Response Agent
+
+For agents with a structured request/response cycle, implement the `AgentLoop` trait:
 
 ```rust
 use da_harness::single_tool::{AgentLoop, LoopConfigBuilder, LoopControl, run_loop};
@@ -99,6 +156,30 @@ async fn main() {
 
 ## Architecture
 
+### Multi-Tool Agents
+
+```
+┌─────────────┐         ┌──────────────┐         ┌──────────────┐
+│  Your Code  │ send    │   Agent      │ tool    │ LLM Endpoint │
+│ (User Input)│────────►│  Loop        │◄───────►│ (OpenAI API) │
+│             │<════════│  (multi_tool)│ text    │              │
+└─────────────┘  result └──────────────┘ response└──────────────┘
+```
+
+1. Define tools using `Tool::new()`, each with a typed argument struct and an async handler.
+2. Build an `AgentInvocation` via `AgentInvocationArgs` with your system prompt, tool list, and an incoming message channel.
+3. Call `run()` — the loop runs until the incoming channel is closed.
+4. The LLM decides whether to call tools or produce a text response. Tool calls are resolved by your handlers, and results are fed back to the LLM.
+
+When the LLM requests multiple tool calls, they can be executed in two modes:
+
+- **Parallel** (`parallel_tools(true)`) — All tool calls run concurrently via `futures::join_all`. Results are collected and returned to the LLM together.
+- **Serial** (`parallel_tools(false)`) — Tool calls execute one at a time, in order. Each result is appended before the next call runs.
+
+If a tool handler returns an error, the error message is still relayed to the LLM so it can recover.
+
+### Typed Request/Response Agents
+
 ```
 ┌─────────────┐          ┌──────────┐         ┌──────────────┐
 │  Your Code  │◄─────────│  Agent   │         │ LLM Endpoint │
@@ -120,7 +201,7 @@ By default there is no iteration cap (the loop runs until the agent returns `Sto
 
 ## Context Compaction
 
-Long-running agents can exceed the model's context window as conversation history grows. `da-harness` handles this automatically:
+Long-running agents can exceed the model's context window as conversation history grows. `da-harness` handles this automatically for typed request/response loops:
 
 1. **Discovery** — On loop start, the framework queries the server's `/models` endpoint (or reads `LLMConfig::max_context_tokens`) to learn the model's maximum context window in tokens.
 2. **Monitoring** — After each LLM response, the framework checks the `prompt_tokens` count reported by the server.
@@ -150,82 +231,14 @@ let config = LoopConfigBuilder::default()
     .unwrap();
 ```
 
-## Multi-Tool Agents
-
-The `single_tool` module works well for agents with a single structured request/response cycle. For more complex scenarios where an agent needs to invoke multiple named functions (tools), use the `multi_tool` module instead.
-
-### Key Differences
-
-| `single_tool` | `multi_tool` |
-|---|---|
-| Single typed request/response loop | Open-ended tool-calling loop |
-| Agent returns `LoopControl::Continue` or `Stop` | Agent drives itself via tool calls and text responses |
-| Conversation history managed by the framework | User messages injected via async channel |
-| Schemas from `Request`/`Response` types | Tool schemas auto-generated from argument types |
-
-### How It Works
-
-1. Define tools using `Tool::new()`, each with a typed argument struct and an async handler.
-2. Build an `AgentInvocation` with your system prompt, tool list, and an incoming message channel.
-3. Call `run()` — the loop runs until the incoming channel is closed.
-4. The LLM decides whether to call tools or produce a text response. Tool calls are resolved by your handlers, and results are fed back to the LLM.
-
-### Example
-
-```rust
-use da_harness::multi_tool::{Tool, AgentInvocationArgs};
-use da_harness::OpenAIClient;
-use serde::Deserialize;
-use schemars::JsonSchema;
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct CalcArgs {
-    expression: String,
-}
-
-let calc_tool = Tool::new::<CalcArgs>(Arc::new(|args| {
-    let expr = args.expression;
-    Box::pin(async move {
-        let result = eval(&expr)?;
-        Ok(format!("Result: {}", result))
-    })
-}))?;
-
-let (tx, rx) = tokio::sync::mpsc::channel(32);
-let invocation = AgentInvocationArgs::default()
-    .system_prompt("You are a helpful assistant with access to tools.")
-    .tools(vec![calc_tool])
-    .parallel_tools(true)
-    .incoming(rx)
-    .agent_message_callback(|msg| Box::pin(async move {
-        println!("Agent message to user: {}", msg);
-        Ok(())
-    }))
-    .agent_idle_callback(|| Box::pin(async move {
-        println!("Agent is awaiting response from user");
-        Ok(())
-    }))
-    .build()
-    .unwrap();
-
-invocation.run(client).await?;
-```
-
-### Tool Execution
-
-When the LLM requests multiple tool calls, they can be executed in two modes:
-
-- **Parallel** (`parallel_tools: true`) — All tool calls run concurrently via `futures::join_all`. Results are collected and returned to the LLM together.
-- **Serial** (`parallel_tools: false`) — Tool calls execute one at a time, in order. Each result is appended before the next call runs.
-
-If a tool handler returns an error, the error message is still relayed to the LLM so it can recover.
-
-### Callbacks
+## Callbacks (Multi-Tool)
 
 | Callback | When Called |
 |---|---|
 | `agent_message_callback` | The LLM produces a text response (no tool calls) |
 | `agent_idle_callback` | No pending user messages and no prior tool call — the agent is waiting for input |
+
+Both callbacks are optional. If not set, they default to no-ops.
 
 ## Prompt Structure
 

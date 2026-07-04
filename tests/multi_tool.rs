@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_openai::types::ChatCompletionRequestUserMessageContent;
 use da_harness::multi_tool::{AgentInvocationArgs, TaskFuture, Tool};
 use da_harness::{LLMConfig, OpenAIClient};
+use futures::FutureExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -50,11 +51,12 @@ async fn multi_tool_count_to_target() {
     let counter_add = counter.clone();
     let add_tool = Tool::new(Arc::new(move |args: Add| {
         let c = counter_add.clone();
-        Box::pin(async move {
+        async move {
             let mut val = c.lock().unwrap();
             *val += args.value;
             Ok("OK".to_owned())
-        })
+        }
+        .boxed()
     }))
     .unwrap();
 
@@ -66,12 +68,13 @@ async fn multi_tool_count_to_target() {
     let stop_tool = Tool::new(Arc::new(move |args: Stop| {
         let c = counter_stop.clone();
         let stx = stop_tx_inner.clone();
-        Box::pin(async move {
+        async move {
             let val = *c.lock().unwrap();
             tracing::info!(counter = val, requested = args.result, "Stop tool called");
             let _ = stx.send(()).await;
             Ok("OK".to_owned())
-        })
+        }
+        .boxed()
     }))
     .unwrap();
 
@@ -87,16 +90,18 @@ async fn multi_tool_count_to_target() {
         .parallel_tools(false)
         .incoming(rx)
         .agent_message_callback(|msg: String| {
-            Box::pin(async move {
+            async move {
                 tracing::info!(msg = %msg, "agent said");
                 Ok(())
-            }) as TaskFuture
+            }
+            .boxed()
         })
         .agent_idle_callback(|| {
-            Box::pin(async move {
+            async move {
                 tracing::info!("agent idle");
                 Ok(())
-            }) as TaskFuture
+            }
+            .boxed()
         })
         .build()
         .unwrap();

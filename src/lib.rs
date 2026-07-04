@@ -8,8 +8,7 @@ pub mod single_tool;
 
 // Re-export types needed by callers constructing user messages and tool schemas.
 pub use async_openai::types::{
-    ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart,
 };
 pub use schemars;
@@ -20,8 +19,8 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage,
-        ChatCompletionTool, CreateChatCompletionRequestArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage, ChatCompletionTool,
+        CreateChatCompletionRequestArgs,
     },
 };
 use tracing::warn;
