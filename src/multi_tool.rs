@@ -106,6 +106,8 @@ impl AgentInvocation {
 
         let mut prev_call = false;
 
+        let mut new_user_messages = 0;
+
         // Track whether we have a pending user message to inject.
         loop {
             // If channel is closed and no pending work, we're done.
@@ -115,7 +117,6 @@ impl AgentInvocation {
             }
 
             // Drain any available user messages from the incoming channel.
-            let mut added = 0;
             while let Ok(msg) = self.incoming.try_recv() {
                 let s = serde_json::to_string(&msg)?;
                 debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
@@ -127,10 +128,11 @@ impl AgentInvocation {
                         .into(),
                 );
                 (self.messages_push_callback)(messages.last().unwrap());
-                added += 1;
+                new_user_messages += 1;
             }
 
-            let (response, _prompt_tokens) = if prev_call || added > 0 {
+            let (response, _prompt_tokens) = if prev_call || new_user_messages > 0 {
+                new_user_messages = 0;
                 client
                     .chat_with_tools(messages.clone(), tools.clone(), self.parallel_tools, 0.6)
                     .await
@@ -149,6 +151,7 @@ impl AgentInvocation {
                             .into(),
                     );
                     (self.messages_push_callback)(messages.last().unwrap());
+                    new_user_messages += 1;
                     continue;
                 } else {
                     break;
