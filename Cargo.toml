@@ -1,6 +1,6 @@
 [package]
 name = "da-harness"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "A framework for running LLM-driven agent loops with structured JSON request/response schemas"
 repository = "https://github.com/da-x/da-harness"
