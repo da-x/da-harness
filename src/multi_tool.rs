@@ -16,6 +16,18 @@ use crate::{OpenAIClient, generate_tool_schema};
 pub type TaskFuture = BoxFuture<'static, anyhow::Result<()>>;
 pub type TaskFutureStr = BoxFuture<'static, anyhow::Result<String>>;
 
+/// User request to the agent loop
+pub enum UserRequest {
+    /// Append a user message to the session
+    Message(ChatCompletionRequestUserMessageContent),
+
+    /// Change temperature used with the LLM
+    ChangeTemperature(f32),
+
+    /// Exit the loop
+    Exit,
+}
+
 fn default_message_callback() -> Arc<dyn Fn(String) -> TaskFuture + Send + Sync> {
     Arc::new(|_: String| async move { Ok(()) }.boxed())
 }
@@ -73,9 +85,8 @@ pub struct AgentInvocation {
     #[builder(default = "false")]
     pub parallel_tools: bool,
 
-    /// Incoming user messages. The implementation will try_recv from this between
-    /// LLM invocations. If closed, the loop ends.
-    pub incoming: tokio::sync::mpsc::Receiver<ChatCompletionRequestUserMessageContent>,
+    /// Process a request to the session
+    pub incoming: tokio::sync::mpsc::Receiver<UserRequest>,
 
     /// Called when agent produces a text response (no tool calls).
     #[builder(default = "default_message_callback()")]
@@ -108,6 +119,8 @@ impl AgentInvocation {
 
         let mut new_user_messages = 0;
 
+        let mut temperature: f32 = 0.5;
+
         // Track whether we have a pending user message to inject.
         loop {
             // If channel is closed and no pending work, we're done.
@@ -116,43 +129,73 @@ impl AgentInvocation {
                 break;
             }
 
-            // Drain any available user messages from the incoming channel.
-            while let Ok(msg) = self.incoming.try_recv() {
-                let s = serde_json::to_string(&msg)?;
-                debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
-                messages.push(
-                    ChatCompletionRequestUserMessageArgs::default()
-                        .content(msg)
-                        .build()
-                        .context("building user message")?
-                        .into(),
-                );
-                (self.messages_push_callback)(messages.last().unwrap());
-                new_user_messages += 1;
+            // Drain any available requests from the incoming channel.
+            while let Ok(req) = self.incoming.try_recv() {
+                match req {
+                    UserRequest::Message(msg) => {
+                        let s = serde_json::to_string(&msg)?;
+                        debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
+                        messages.push(
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content(msg)
+                                .build()
+                                .context("building user message")?
+                                .into(),
+                        );
+                        (self.messages_push_callback)(messages.last().unwrap());
+                        new_user_messages += 1;
+                    }
+                    UserRequest::ChangeTemperature(temp) => {
+                        info!(target: "da_harness::multi_tool", temperature = temp, "<< temperature changed");
+                        temperature = temp;
+                    }
+                    UserRequest::Exit => {
+                        info!(target: "da_harness::multi_tool", "<< exit requested");
+                        return Ok(());
+                    }
+                }
             }
 
             let (response, _prompt_tokens) = if prev_call || new_user_messages > 0 {
                 new_user_messages = 0;
                 client
-                    .chat_with_tools(messages.clone(), tools.clone(), self.parallel_tools, 0.6)
+                    .chat_with_tools(
+                        messages.clone(),
+                        tools.clone(),
+                        self.parallel_tools,
+                        temperature,
+                    )
                     .await
                     .context("LLM chat call failed")?
             } else {
                 (self.agent_idle_callback)().await?;
 
-                if let Some(msg) = self.incoming.recv().await {
-                    let s = serde_json::to_string(&msg)?;
-                    debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
-                    messages.push(
-                        ChatCompletionRequestUserMessageArgs::default()
-                            .content(msg)
-                            .build()
-                            .context("building user message")?
-                            .into(),
-                    );
-                    (self.messages_push_callback)(messages.last().unwrap());
-                    new_user_messages += 1;
-                    continue;
+                if let Some(req) = self.incoming.recv().await {
+                    match req {
+                        UserRequest::Message(msg) => {
+                            let s = serde_json::to_string(&msg)?;
+                            debug!(target: "da_harness::multi_tool", msg = s, "<< user message received");
+                            messages.push(
+                                ChatCompletionRequestUserMessageArgs::default()
+                                    .content(msg)
+                                    .build()
+                                    .context("building user message")?
+                                    .into(),
+                            );
+                            (self.messages_push_callback)(messages.last().unwrap());
+                            new_user_messages += 1;
+                            continue;
+                        }
+                        UserRequest::ChangeTemperature(temp) => {
+                            info!(target: "da_harness::multi_tool", temperature = temp, "<< temperature changed");
+                            temperature = temp;
+                            continue;
+                        }
+                        UserRequest::Exit => {
+                            info!(target: "da_harness::multi_tool", "<< exit requested");
+                            return Ok(());
+                        }
+                    }
                 } else {
                     break;
                 }

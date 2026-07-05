@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_openai::types::ChatCompletionRequestUserMessageContent;
-use da_harness::multi_tool::{AgentInvocationArgs, TaskFuture, Tool};
+use da_harness::multi_tool::{AgentInvocationArgs, TaskFuture, Tool, UserRequest};
 use da_harness::{LLMConfig, OpenAIClient};
 use futures::FutureExt;
 use schemars::JsonSchema;
@@ -118,9 +118,9 @@ async fn multi_tool_count_to_target() {
     let run_handle = tokio::spawn(invocation.run(client));
 
     // Send initial user message.
-    tx.send(ChatCompletionRequestUserMessageContent::Text(
+    tx.send(UserRequest::Message(ChatCompletionRequestUserMessageContent::Text(
         "Start counting from 0 to 5.".to_string(),
-    ))
+    )))
     .await
     .unwrap();
 
