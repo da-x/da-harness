@@ -24,6 +24,10 @@ fn default_idle_callback() -> Arc<dyn Fn() -> TaskFuture + Send + Sync> {
     Arc::new(|| async move { Ok(()) }.boxed())
 }
 
+fn default_push_callback() -> Arc<dyn Fn(&ChatCompletionRequestMessage) + Send + Sync> {
+    Arc::new(|_: &ChatCompletionRequestMessage| {})
+}
+
 #[derive(Clone)]
 pub struct Tool {
     handler: Arc<dyn Fn(serde_json::Value) -> TaskFutureStr + Send + Sync>,
@@ -80,6 +84,10 @@ pub struct AgentInvocation {
     /// Called when the agent is idle, waiting for incoming user messages.
     #[builder(default = "default_idle_callback()")]
     pub agent_idle_callback: Arc<dyn Fn() -> TaskFuture + Send + Sync>,
+
+    /// Called after a message is pushed to the conversation history.
+    #[builder(default = "default_push_callback()")]
+    pub messages_push_callback: Arc<dyn Fn(&ChatCompletionRequestMessage) + Send + Sync>,
 }
 
 impl AgentInvocation {
@@ -118,6 +126,7 @@ impl AgentInvocation {
                         .context("building user message")?
                         .into(),
                 );
+                (self.messages_push_callback)(messages.last().unwrap());
                 added += 1;
             }
 
@@ -139,6 +148,7 @@ impl AgentInvocation {
                             .context("building user message")?
                             .into(),
                     );
+                    (self.messages_push_callback)(messages.last().unwrap());
                     continue;
                 } else {
                     break;
@@ -192,6 +202,7 @@ impl AgentInvocation {
                                 .context("building tool message")?
                                 .into(),
                         );
+                        (self.messages_push_callback)(messages.last().unwrap());
                     }
                 } else {
                     for tc in tool_calls {
@@ -208,6 +219,7 @@ impl AgentInvocation {
                                 .context("building tool message")?
                                 .into(),
                         );
+                        (self.messages_push_callback)(messages.last().unwrap());
                     }
                 }
             }
