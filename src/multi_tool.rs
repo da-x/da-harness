@@ -171,6 +171,14 @@ impl AgentInvocation {
                 asst_builder.refusal(c.as_str());
             }
 
+            messages.push(
+                asst_builder
+                    .build()
+                    .context("building tool message")?
+                    .into(),
+            );
+            (self.messages_push_callback)(messages.last().unwrap());
+
             if let Some(tool_calls) = &response.tool_calls {
                 info!(
                     target: "da_harness::multi_tool",
