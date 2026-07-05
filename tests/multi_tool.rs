@@ -6,6 +6,7 @@ use da_harness::{LLMConfig, OpenAIClient};
 use futures::FutureExt;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tracing::info;
 
 /// Adds the given value to the running counter.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -54,7 +55,8 @@ async fn multi_tool_count_to_target() {
         async move {
             let mut val = c.lock().unwrap();
             *val += args.value;
-            Ok("OK".to_owned())
+            info!("tool called, value changed to {}", *val);
+            Ok(format!("OK, value is now {}", *val))
         }
         .boxed()
     }))
