@@ -66,6 +66,11 @@ impl Tool {
             description,
         })
     }
+
+    /// OpenAI function name for this tool (from the generated schema).
+    pub fn name(&self) -> &str {
+        self.description.function.name.as_str()
+    }
 }
 
 #[derive(derive_builder::Builder)]
