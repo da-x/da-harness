@@ -9,15 +9,15 @@ pub mod single_tool;
 // Re-export types needed by callers constructing user messages and tool schemas.
 pub use async_openai::types::{
     ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
-    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, ChatCompletionToolType, FunctionCall,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionToolType, FunctionCall,
 };
 pub use schemars;
 
@@ -26,9 +26,8 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseMessage, ChatCompletionTool,
-        CreateChatCompletionRequestArgs,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionResponseMessage, ChatCompletionTool, CreateChatCompletionRequestArgs,
     },
 };
 use tracing::warn;

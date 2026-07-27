@@ -20,6 +20,7 @@ Key features:
 - **Few-shot examples** — Provide example request/response pairs formatted into the prompt automatically (`single_tool`).
 - **Conversation history** — Full history included each iteration so the LLM has context.
 - **Automatic context compaction** — When prompt usage approaches the model's context window, the loop automatically summarizes earlier turns and truncates history (`single_tool`).
+- **History-rewriting tools** — Multi-tool agents can register tools that replace conversation history mid-session (e.g. model-directed self-compaction).
 - **Health checking** — Built-in endpoint health checks and readiness polling for `OpenAIClient`.
 
 ## Quick Start
@@ -237,8 +238,49 @@ let config = LoopConfigBuilder::default()
 |---|---|
 | `agent_message_callback` | The LLM produces a text response (no tool calls) |
 | `agent_idle_callback` | No pending user messages and no prior tool call — the agent is waiting for input |
+| `messages_push_callback` | After each message is appended to the in-memory conversation history |
+| `messages_replace_callback` | After a history-rewriting tool replaces history; called with `(old_messages, new_messages)` before that tool's result is appended |
 
-Both callbacks are optional. If not set, they default to no-ops.
+All callbacks are optional. If not set, they default to no-ops.
+
+## History-Rewriting Tools (Multi-Tool)
+
+Unlike `single_tool` automatic compaction (token-threshold driven), multi-tool agents can expose a **rewriting tool** the model may call when it wants to reshape history — for example self-compaction, redaction, or session branching.
+
+```rust
+use da_harness::multi_tool::Tool;
+use da_harness::ChatCompletionRequestMessage;
+
+/// Drop old turns; keep the system message and a short tail.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct CompactArgs {
+    /// How many trailing messages to keep after the system message.
+    keep_last: usize,
+}
+
+let compact = Tool::new_rewriting(Arc::new(|args: CompactArgs, mut messages| {
+    async move {
+        if messages.len() > 1 {
+            let system = messages[0].clone();
+            let tail_start = messages.len().saturating_sub(args.keep_last).max(1);
+            let mut kept = vec![system];
+            kept.extend(messages.drain(tail_start..));
+            messages = kept;
+        }
+        // Keep the trailing assistant tool_calls turn so the loop can append
+        // this tool's result (OpenAI protocol).
+        let content = format!("history now has {} messages", messages.len());
+        Ok((content, messages))
+    }.boxed()
+}))?;
+```
+
+**Invariants** (see `multi_tool` module docs for full detail):
+
+1. The handler receives an **owned snapshot** of history (so it may `.await`, e.g. call an LLM to summarize) and returns `(tool_content, new_messages)`.
+2. `new_messages` must remain a valid prefix for appending one more `role=tool` message for this call — usually keep the trailing assistant `tool_calls` message.
+3. Batches that include any rewriting tool run **serially** even when `parallel_tools` is true.
+4. Persistence hosts should honor `messages_replace_callback` as authoritative after a rewrite; `messages_push_callback` alone is append-only.
 
 ## Prompt Structure
 

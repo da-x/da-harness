@@ -118,9 +118,9 @@ async fn multi_tool_count_to_target() {
     let run_handle = tokio::spawn(invocation.run(client));
 
     // Send initial user message.
-    tx.send(UserRequest::Message(ChatCompletionRequestUserMessageContent::Text(
-        "Start counting from 0 to 5.".to_string(),
-    )))
+    tx.send(UserRequest::Message(
+        ChatCompletionRequestUserMessageContent::Text("Start counting from 0 to 5.".to_string()),
+    ))
     .await
     .unwrap();
 
