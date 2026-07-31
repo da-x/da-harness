@@ -53,16 +53,24 @@
 //!   rewriting tool, with `(old_messages, new_messages)`; hosts that persist
 //!   history should treat the new list as authoritative (do not rely on push
 //!   alone after a rewrite).
+//!
+//! ## Testing without a live LLM
+//!
+//! Set [`AgentInvocation::inference_callback`] to replace each `chat_with_tools`
+//! turn with a deterministic callback, then call
+//! [`AgentInvocation::run_without_client`]. Helpers [`assistant_text`] and
+//! [`assistant_tool_calls`] build mock model responses for tests.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use async_openai::types::{
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
-    ChatCompletionTool,
+    ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage, ChatCompletionTool,
+    Role,
 };
 use futures::{FutureExt, future::BoxFuture};
 use serde::Deserialize;
@@ -86,6 +94,53 @@ pub type MessagesPushCallback = Arc<dyn Fn(&ChatCompletionRequestMessage) + Send
 /// is appended).
 pub type MessagesReplaceCallback =
     Arc<dyn Fn(&[ChatCompletionRequestMessage], &[ChatCompletionRequestMessage]) + Send + Sync>;
+
+/// Replaces a single `chat_with_tools` turn when set (primarily for tests).
+///
+/// Receives a snapshot of the conversation history at inference time.
+/// Returns the assistant turn the real model would have produced
+/// (`content` and/or `tool_calls`). Token usage is not modeled; the loop
+/// sees `prompt_tokens = None`.
+///
+/// Use with [`AgentInvocation::run_without_client`]. Helpers
+/// [`assistant_text`] and [`assistant_tool_calls`] build responses without
+/// depending on `async-openai` field layout.
+pub type InferenceCallback = Arc<
+    dyn Fn(
+            Vec<ChatCompletionRequestMessage>,
+        ) -> BoxFuture<'static, anyhow::Result<ChatCompletionResponseMessage>>
+        + Send
+        + Sync,
+>;
+
+/// Build a text-only assistant response for use with [`InferenceCallback`].
+pub fn assistant_text(content: impl Into<String>) -> ChatCompletionResponseMessage {
+    #[allow(deprecated)]
+    ChatCompletionResponseMessage {
+        content: Some(content.into()),
+        refusal: None,
+        tool_calls: None,
+        role: Role::Assistant,
+        function_call: None,
+        audio: None,
+    }
+}
+
+/// Build an assistant response that requests tool calls for use with
+/// [`InferenceCallback`].
+pub fn assistant_tool_calls(
+    calls: Vec<ChatCompletionMessageToolCall>,
+) -> ChatCompletionResponseMessage {
+    #[allow(deprecated)]
+    ChatCompletionResponseMessage {
+        content: None,
+        refusal: None,
+        tool_calls: Some(calls),
+        role: Role::Assistant,
+        function_call: None,
+        audio: None,
+    }
+}
 
 /// Result of a history-rewriting tool: tool message content + replacement history.
 pub type RewriteOutcome = (String, Vec<ChatCompletionRequestMessage>);
@@ -297,8 +352,19 @@ pub struct AgentInvocation {
     ///
     /// Use [`AgentInvocationArgs::retry_strategy`] to set this from any cloneable
     /// `IntoIterator<Item = Duration>` (e.g. `ExponentialBackoff`, `FixedInterval`).
+    ///
+    /// Not used when [`Self::inference_callback`] is set.
     #[builder(default, setter(custom))]
     pub retry_strategy: Option<RetryStrategyFactory>,
+
+    /// When set, used instead of [`OpenAIClient::chat_with_tools`] for each
+    /// inference turn. Intended for deterministic harness tests.
+    ///
+    /// Prefer [`AgentInvocation::run_without_client`] so no live client is required.
+    /// If both a client and this callback are provided (via [`AgentInvocation::run`]),
+    /// the callback wins and no network call is made.
+    #[builder(default, setter(strip_option))]
+    pub inference_callback: Option<InferenceCallback>,
 }
 
 impl AgentInvocationArgs {
@@ -332,7 +398,27 @@ impl AgentInvocationArgs {
 }
 
 impl AgentInvocation {
-    pub async fn run(mut self, client: OpenAIClient) -> anyhow::Result<()> {
+    /// Run the agent loop against a live OpenAI-compatible client.
+    ///
+    /// If [`Self::inference_callback`] is set, that callback is used for each
+    /// inference turn and the client is not contacted.
+    pub async fn run(self, client: OpenAIClient) -> anyhow::Result<()> {
+        self.run_inner(Some(client)).await
+    }
+
+    /// Run the agent loop without a live LLM client.
+    ///
+    /// Requires [`Self::inference_callback`] to be set; each inference turn is
+    /// answered by that callback instead of `chat_with_tools`.
+    pub async fn run_without_client(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inference_callback.is_some(),
+            "run_without_client requires inference_callback"
+        );
+        self.run_inner(None).await
+    }
+
+    async fn run_inner(mut self, client: Option<OpenAIClient>) -> anyhow::Result<()> {
         let tools: Vec<ChatCompletionTool> =
             self.tools.iter().map(|t| t.description.clone()).collect();
 
@@ -390,9 +476,14 @@ impl AgentInvocation {
                 new_user_messages = 0;
                 // `_prompt_tokens` is available for hosts that want usage-aware
                 // prompts; multi_tool does not auto-compact on thresholds.
-                self.chat_with_tools_retrying(&client, messages.clone(), tools.clone(), temperature)
-                    .await
-                    .context("LLM chat call failed")?
+                self.chat_with_tools_retrying(
+                    client.as_ref(),
+                    messages.clone(),
+                    tools.clone(),
+                    temperature,
+                )
+                .await
+                .context("LLM chat call failed")?
             } else {
                 (self.agent_idle_callback)().await?;
 
@@ -622,17 +713,27 @@ impl AgentInvocation {
         }
     }
 
-    /// Call `chat_with_tools`, optionally retrying with the configured strategy.
+    /// Call `chat_with_tools` (or the inference callback), optionally retrying.
+    ///
+    /// When [`Self::inference_callback`] is set, the callback answers the turn
+    /// and `client` / retry strategy are unused. Otherwise a live client is required.
     async fn chat_with_tools_retrying(
         &self,
-        client: &OpenAIClient,
+        client: Option<&OpenAIClient>,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: Vec<ChatCompletionTool>,
         temperature: f32,
-    ) -> anyhow::Result<(
-        async_openai::types::ChatCompletionResponseMessage,
-        Option<u32>,
-    )> {
+    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<u32>)> {
+        if let Some(cb) = &self.inference_callback {
+            let response = cb(messages)
+                .await
+                .context("inference callback failed")?;
+            return Ok((response, None));
+        }
+
+        let client = client.context(
+            "OpenAIClient required when inference_callback is not set",
+        )?;
         let parallel_tools = self.parallel_tools;
 
         match &self.retry_strategy {
@@ -786,5 +887,197 @@ mod tests {
         .unwrap();
         assert!(!tool.is_rewriting());
         assert_eq!(tool.name(), "NoArgs");
+    }
+
+    #[tokio::test]
+    async fn run_without_client_requires_inference_callback() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .incoming(rx)
+            .build()
+            .unwrap();
+
+        let err = invocation
+            .run_without_client()
+            .await
+            .expect_err("should require inference_callback");
+        assert!(
+            err.to_string().contains("inference_callback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_callback_text_reply() {
+        use std::sync::Mutex;
+
+        let pushed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let pushed_cb = pushed.clone();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        let cb: InferenceCallback = Arc::new(|messages| {
+            async move {
+                assert!(
+                    messages.len() >= 2,
+                    "expected system + user, got {}",
+                    messages.len()
+                );
+                Ok(assistant_text("hello from mock"))
+            }
+            .boxed()
+        });
+
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .incoming(rx)
+            .inference_callback(cb)
+            .messages_push_callback({
+                let done_tx = done_tx.clone();
+                let cb: MessagesPushCallback = Arc::new(move |msg| {
+                    let s = format!("{msg:?}");
+                    if s.contains("hello from mock") {
+                        let _ = done_tx.try_send(());
+                    }
+                    pushed_cb.lock().unwrap().push(s);
+                });
+                cb
+            })
+            .build()
+            .unwrap();
+
+        // Keep the sender open until the assistant turn is recorded; the loop
+        // exits as soon as `incoming` is closed.
+        let run = tokio::spawn(invocation.run_without_client());
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("hi".into()),
+        ))
+        .await
+        .unwrap();
+        done_rx.recv().await.expect("assistant reply");
+        drop(tx);
+
+        run.await.expect("join").unwrap();
+
+        let log = pushed.lock().unwrap();
+        assert!(
+            log.iter().any(|s| s.contains("hello from mock")),
+            "assistant text should be pushed; got {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_callback_tool_then_text() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tool_hits = Arc::new(AtomicUsize::new(0));
+        let tool_hits_cb = tool_hits.clone();
+        let tool = Tool::new(Arc::new(move |_: NoArgs| {
+            let hits = tool_hits_cb.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok("tool-ok".to_owned())
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let saw_tool_result = Arc::new(AtomicUsize::new(0));
+        let saw_tool_result_cb = saw_tool_result.clone();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let cb: InferenceCallback = Arc::new(move |messages| {
+            let step = step.clone();
+            let saw = saw_tool_result_cb.clone();
+            let done_tx = done_tx.clone();
+            async move {
+                let n = step.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => {
+                        assert!(
+                            messages.len() >= 2,
+                            "first turn: system + user, got {}",
+                            messages.len()
+                        );
+                        Ok(assistant_tool_calls(vec![dummy_tool_call("NoArgs", "{}")]))
+                    }
+                    1 => {
+                        // After tool execution, history should include a tool result.
+                        let has_tool = messages
+                            .iter()
+                            .any(|m| matches!(m, ChatCompletionRequestMessage::Tool(_)));
+                        if has_tool {
+                            saw.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let _ = done_tx.send(()).await;
+                        Ok(assistant_text("all done"))
+                    }
+                    _ => Ok(assistant_text("extra")),
+                }
+            }
+            .boxed()
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .tools(vec![tool])
+            .incoming(rx)
+            .inference_callback(cb)
+            .build()
+            .unwrap();
+
+        let run = tokio::spawn(invocation.run_without_client());
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("go".into()),
+        ))
+        .await
+        .unwrap();
+        done_rx.recv().await.expect("second inference turn");
+        drop(tx);
+
+        run.await.expect("join").unwrap();
+
+        assert_eq!(tool_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(saw_tool_result.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inference_callback_error_surfaces() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        let cb: InferenceCallback = Arc::new(|_messages| {
+            async move { Err(anyhow::anyhow!("mock boom")) }.boxed()
+        });
+
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .incoming(rx)
+            .inference_callback(cb)
+            .build()
+            .unwrap();
+
+        // Spawn first so the open sender is not closed before the loop runs.
+        let run = tokio::spawn(invocation.run_without_client());
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("hi".into()),
+        ))
+        .await
+        .unwrap();
+
+        let err = run
+            .await
+            .expect("join")
+            .expect_err("callback error should fail run");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mock boom") || msg.contains("inference callback"),
+            "unexpected error: {msg}"
+        );
     }
 }

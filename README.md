@@ -240,8 +240,38 @@ let config = LoopConfigBuilder::default()
 | `agent_idle_callback` | No pending user messages and no prior tool call — the agent is waiting for input |
 | `messages_push_callback` | After each message is appended to the in-memory conversation history |
 | `messages_replace_callback` | After a history-rewriting tool replaces history; called with `(old_messages, new_messages)` before that tool's result is appended |
+| `inference_callback` | Optional stand-in for each `chat_with_tools` turn (tests / offline runs). Receives conversation messages; returns a `ChatCompletionResponseMessage` |
 
-All callbacks are optional. If not set, they default to no-ops.
+All callbacks are optional. If not set, they default to no-ops (except `inference_callback`, which defaults to unset — live LLM path).
+
+### Testing without a live LLM
+
+Set `inference_callback` and call `run_without_client()` so the agent loop never contacts an API. Use the exported helpers to build mock assistant turns:
+
+```rust
+use da_harness::multi_tool::{
+    assistant_text, assistant_tool_calls, AgentInvocationArgs, InferenceCallback, UserRequest,
+};
+use std::sync::Arc;
+use futures::FutureExt;
+
+let cb: InferenceCallback = Arc::new(|_messages| {
+    async move { Ok(assistant_text("hello from mock")) }.boxed()
+});
+
+let (tx, rx) = tokio::sync::mpsc::channel(4);
+let invocation = AgentInvocationArgs::default()
+    .system_prompt("You are a test agent.")
+    .incoming(rx)
+    .inference_callback(cb)
+    .build()
+    .unwrap();
+
+// … send UserRequest::Message on tx, then:
+// invocation.run_without_client().await?;
+```
+
+`assistant_tool_calls(vec![…])` builds a turn that triggers real tool handlers, so you can unit-test tool dispatch and history callbacks offline.
 
 ## History-Rewriting Tools (Multi-Tool)
 
