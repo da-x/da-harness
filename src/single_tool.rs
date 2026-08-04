@@ -441,11 +441,12 @@ pub async fn run_loop<Agent: AgentLoop + Send>(
                 .into(),
         ];
 
-        let (response_text, prompt_tokens) = client
+        let (response_text, usage) = client
             .chat_with_usage(messages, 0.6)
             .await
             .context("LLM chat call failed")?;
 
+        let prompt_tokens = usage.map(|u| u.prompt_tokens);
         info!(target: "da_harness::loop", iteration, reply = %response_text, used_prompt_tokens = ?prompt_tokens, "<< raw LLM reply");
 
         let json_text = crate::extract_json(&response_text);

@@ -12,9 +12,9 @@
 //! This is complementary to [`crate::single_tool`]'s *automatic* compaction,
 //! which rewrites typed request/response history when token usage is high.
 //! Here the **model** chooses when to call a rewrite tool; there is no
-//! automatic token-threshold trigger in this module (`prompt_tokens` from each
-//! chat call are currently unused — hosts may surface usage in the system
-//! prompt or pass explicit tool args such as `keep_last`).
+//! automatic token-threshold trigger in this module. Per-turn [`TokenUsage`] is
+//! forwarded via [`AgentInvocation::usage_callback`] so hosts can log session
+//! totals, cost, and context fill.
 //!
 //! ## Protocol invariants for rewriting handlers
 //!
@@ -77,7 +77,7 @@ use serde::Deserialize;
 use tokio_retry::Retry;
 use tracing::{debug, info, warn};
 
-use crate::{OpenAIClient, generate_tool_schema};
+use crate::{OpenAIClient, TokenUsage, generate_tool_schema};
 
 pub use tokio_retry;
 
@@ -95,12 +95,18 @@ pub type MessagesPushCallback = Arc<dyn Fn(&ChatCompletionRequestMessage) + Send
 pub type MessagesReplaceCallback =
     Arc<dyn Fn(&[ChatCompletionRequestMessage], &[ChatCompletionRequestMessage]) + Send + Sync>;
 
+/// Callback after a successful LLM chat turn that reported token usage.
+///
+/// Not invoked when the server omits usage, or when [`InferenceCallback`] is used
+/// (mock turns have no usage).
+pub type UsageCallback = Arc<dyn Fn(TokenUsage) + Send + Sync>;
+
 /// Replaces a single `chat_with_tools` turn when set (primarily for tests).
 ///
 /// Receives a snapshot of the conversation history at inference time.
 /// Returns the assistant turn the real model would have produced
 /// (`content` and/or `tool_calls`). Token usage is not modeled; the loop
-/// sees `prompt_tokens = None`.
+/// sees `usage = None`.
 ///
 /// Use with [`AgentInvocation::run_without_client`]. Helpers
 /// [`assistant_text`] and [`assistant_tool_calls`] build responses without
@@ -205,6 +211,10 @@ fn default_push_callback() -> MessagesPushCallback {
 
 fn default_replace_callback() -> MessagesReplaceCallback {
     Arc::new(|_: &[ChatCompletionRequestMessage], _: &[ChatCompletionRequestMessage]| {})
+}
+
+fn default_usage_callback() -> UsageCallback {
+    Arc::new(|_: TokenUsage| {})
 }
 
 /// Internal tool implementation: normal result-only vs history-rewriting.
@@ -343,6 +353,13 @@ pub struct AgentInvocation {
     #[builder(default = "default_replace_callback()")]
     pub messages_replace_callback: MessagesReplaceCallback,
 
+    /// Called after each successful LLM turn that reports token usage.
+    ///
+    /// Hosts can accumulate session totals, estimate cost, and log context fill.
+    /// Not called for mock inference or when the server omits usage.
+    #[builder(default = "default_usage_callback()")]
+    pub usage_callback: UsageCallback,
+
     /// Optional [tokio-retry](https://crates.io/crates/tokio-retry) strategy for each
     /// `chat_with_tools` LLM call.
     ///
@@ -472,10 +489,8 @@ impl AgentInvocation {
                 }
             }
 
-            let (response, _prompt_tokens) = if prev_call || new_user_messages > 0 {
+            let (response, usage) = if prev_call || new_user_messages > 0 {
                 new_user_messages = 0;
-                // `_prompt_tokens` is available for hosts that want usage-aware
-                // prompts; multi_tool does not auto-compact on thresholds.
                 self.chat_with_tools_retrying(
                     client.as_ref(),
                     messages.clone(),
@@ -517,6 +532,10 @@ impl AgentInvocation {
                     break;
                 }
             };
+
+            if let Some(u) = usage {
+                (self.usage_callback)(u);
+            }
 
             let mut asst_builder = ChatCompletionRequestAssistantMessageArgs::default();
             if let Some(tool_calls) = &response.tool_calls {
@@ -723,17 +742,13 @@ impl AgentInvocation {
         messages: Vec<ChatCompletionRequestMessage>,
         tools: Vec<ChatCompletionTool>,
         temperature: f32,
-    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<u32>)> {
+    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<TokenUsage>)> {
         if let Some(cb) = &self.inference_callback {
-            let response = cb(messages)
-                .await
-                .context("inference callback failed")?;
+            let response = cb(messages).await.context("inference callback failed")?;
             return Ok((response, None));
         }
 
-        let client = client.context(
-            "OpenAIClient required when inference_callback is not set",
-        )?;
+        let client = client.context("OpenAIClient required when inference_callback is not set")?;
         let parallel_tools = self.parallel_tools;
 
         match &self.retry_strategy {
@@ -1051,9 +1066,8 @@ mod tests {
     async fn inference_callback_error_surfaces() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
-        let cb: InferenceCallback = Arc::new(|_messages| {
-            async move { Err(anyhow::anyhow!("mock boom")) }.boxed()
-        });
+        let cb: InferenceCallback =
+            Arc::new(|_messages| async move { Err(anyhow::anyhow!("mock boom")) }.boxed());
 
         let invocation = AgentInvocationArgs::default()
             .system_prompt("sys")

@@ -27,10 +27,41 @@ use async_openai::{
     config::OpenAIConfig,
     types::{
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionResponseMessage, ChatCompletionTool, CreateChatCompletionRequestArgs,
+        ChatCompletionResponseMessage, ChatCompletionTool, CompletionUsage,
+        CreateChatCompletionRequestArgs,
     },
 };
 use tracing::warn;
+
+// ─── Token usage ───────────────────────────────────────────────────────────
+
+/// Token counts reported by an OpenAI-compatible chat completion response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Tokens in the prompt (input / context).
+    pub prompt_tokens: u32,
+    /// Tokens in the generated completion (output).
+    pub completion_tokens: u32,
+    /// Total tokens for the request (`prompt + completion` when both reported).
+    pub total_tokens: u32,
+    /// Cached prompt tokens when the server reports `prompt_tokens_details`.
+    pub cached_prompt_tokens: Option<u32>,
+}
+
+impl TokenUsage {
+    /// Build from `async_openai`'s [`CompletionUsage`], if present.
+    pub fn from_completion_usage(usage: &CompletionUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_prompt_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+        }
+    }
+}
 
 // ─── OpenAIClient ──────────────────────────────────────────────────────
 
@@ -216,17 +247,16 @@ impl OpenAIClient {
     }
 
     /// Sends a chat completion request and returns the assistant's text response
-    /// along with the number of prompt tokens used for the request (if the server
-    /// reported usage).
+    /// along with token usage (if the server reported it).
     ///
-    /// The returned `Option<u32>` is the `prompt_tokens` value from the
-    /// `CompletionUsage` object in the response (when present). This is the
-    /// primary signal used by the run loop to decide when to trigger compaction.
+    /// The returned [`TokenUsage`] (when present) is the primary signal used by
+    /// the single-tool run loop to decide when to trigger compaction
+    /// (`prompt_tokens` vs context window).
     pub async fn chat_with_usage(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         temperature: f32,
-    ) -> anyhow::Result<(String, Option<u32>)> {
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let request = CreateChatCompletionRequestArgs::default()
             .model(self.model_name())
             .messages(messages)
@@ -241,19 +271,22 @@ impl OpenAIClient {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("LLM returned no content"))?;
 
-        let prompt_tokens = response.usage.map(|u| u.prompt_tokens);
-        Ok((text, prompt_tokens))
+        let usage = response
+            .usage
+            .as_ref()
+            .map(TokenUsage::from_completion_usage);
+        Ok((text, usage))
     }
 
     /// Sends a chat completion request with tools and returns the full response
-    /// message (including `tool_calls`) along with prompt token usage.
+    /// message (including `tool_calls`) along with token usage when reported.
     pub async fn chat_with_tools(
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: Vec<ChatCompletionTool>,
         parallel_tool_calls: bool,
         temperature: f32,
-    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<u32>)> {
+    ) -> anyhow::Result<(ChatCompletionResponseMessage, Option<TokenUsage>)> {
         let mut request = CreateChatCompletionRequestArgs::default()
             .model(self.model_name())
             .messages(messages)
@@ -265,8 +298,11 @@ impl OpenAIClient {
 
         let response = self.client.chat().create(request).await?;
 
-        let prompt_tokens = response.usage.map(|u| u.prompt_tokens);
-        Ok((response.choices[0].message.clone(), prompt_tokens))
+        let usage = response
+            .usage
+            .as_ref()
+            .map(TokenUsage::from_completion_usage);
+        Ok((response.choices[0].message.clone(), usage))
     }
 
     /// Checks whether the LLM endpoint is reachable by sending a minimal
