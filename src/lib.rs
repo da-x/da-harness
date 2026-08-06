@@ -21,6 +21,8 @@ pub use async_openai::types::{
 };
 pub use schemars;
 
+use std::collections::HashMap;
+
 use anyhow::Context;
 use async_openai::{
     Client,
@@ -31,6 +33,7 @@ use async_openai::{
         CreateChatCompletionRequestArgs,
     },
 };
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tracing::warn;
 
 // ─── Token usage ───────────────────────────────────────────────────────────
@@ -65,6 +68,23 @@ impl TokenUsage {
 
 // ─── OpenAIClient ──────────────────────────────────────────────────────
 
+/// Build a [`HeaderMap`] from string name/value pairs; skip invalid entries.
+fn header_map_from_pairs(pairs: &HashMap<String, String>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            warn!(header = %name, "skipping invalid HTTP header name in LLMConfig::extra_headers");
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            warn!(header = %name, "skipping invalid HTTP header value in LLMConfig::extra_headers");
+            continue;
+        };
+        headers.insert(header_name, header_value);
+    }
+    headers
+}
+
 /// Configuration for connecting to an OpenAI-compatible LLM endpoint.
 #[derive(Debug, Clone)]
 pub struct LLMConfig {
@@ -80,6 +100,11 @@ pub struct LLMConfig {
     /// instead of discovering it from the server's `/models` endpoint.
     /// Useful for testing compaction with a deliberately small window.
     pub max_context_tokens: Option<usize>,
+    /// Extra HTTP headers sent on every request (e.g. provider-specific auth).
+    ///
+    /// Merged with the standard `Authorization: Bearer <api_key>` header from
+    /// [`Self::api_key`]. Invalid header names/values are skipped with a warning.
+    pub extra_headers: HashMap<String, String>,
 }
 
 impl Default for LLMConfig {
@@ -91,6 +116,7 @@ impl Default for LLMConfig {
             model_name: "LocalModel".to_owned(),
             api_key: "".to_owned(),
             max_context_tokens: None,
+            extra_headers: HashMap::new(),
         }
     }
 }
@@ -110,6 +136,8 @@ pub struct OpenAIClient {
     client: Client<OpenAIConfig>,
     model_name: String,
     max_context_tokens: Option<usize>,
+    /// Provider-specific headers applied on every request (including `/models`).
+    extra_headers: HeaderMap,
 }
 
 impl Default for OpenAIClient {
@@ -134,10 +162,17 @@ impl OpenAIClient {
             async_config = async_config.with_api_base(base);
         }
 
+        let extra_headers = header_map_from_pairs(&config.extra_headers);
+        let http_client = reqwest::Client::builder()
+            .default_headers(extra_headers.clone())
+            .build()
+            .expect("failed to build reqwest client for OpenAIClient");
+
         Self {
-            client: Client::with_config(async_config),
+            client: Client::with_config(async_config).with_http_client(http_client),
             model_name: config.model_name,
             max_context_tokens: config.max_context_tokens,
+            extra_headers,
         }
     }
 
@@ -176,7 +211,10 @@ impl OpenAIClient {
 
         let cfg = self.client.config();
         let url = cfg.url("/models");
-        let headers = cfg.headers();
+        let mut headers = cfg.headers();
+        for (name, value) in self.extra_headers.iter() {
+            headers.insert(name, value.clone());
+        }
         let qparams = cfg.query();
 
         let resp = reqwest::Client::new()

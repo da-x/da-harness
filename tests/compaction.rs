@@ -148,6 +148,7 @@ fn client_from_env() -> OpenAIClient {
         model_name,
         api_key,
         max_context_tokens: None, // we force via the run_loop param below
+        extra_headers: Default::default(),
     })
 }
 
