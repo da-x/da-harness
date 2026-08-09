@@ -234,13 +234,14 @@ let config = LoopConfigBuilder::default()
 
 ## Callbacks (Multi-Tool)
 
-| Callback | When Called |
+| Callback / field | When Called / meaning |
 |---|---|
 | `agent_message_callback` | The LLM produces a text response (no tool calls) |
 | `agent_idle_callback` | No pending user messages and no prior tool call — the agent is waiting for input |
 | `messages_push_callback` | After each message is appended to the in-memory conversation history |
 | `messages_replace_callback` | After a history-rewriting tool replaces history; called with `(old_messages, new_messages)` before that tool's result is appended |
 | `inference_callback` | Optional stand-in for each `chat_with_tools` turn (tests / offline runs). Receives conversation messages; returns a `ChatCompletionResponseMessage` |
+| `seed_messages` | Optional history inserted after the system prompt before the loop accepts new user messages (session continuation). Each entry is push-callback'd. Does not alone trigger an LLM turn. |
 
 All callbacks are optional. If not set, they default to no-ops (except `inference_callback`, which defaults to unset — live LLM path).
 

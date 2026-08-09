@@ -382,6 +382,20 @@ pub struct AgentInvocation {
     /// the callback wins and no network call is made.
     #[builder(default, setter(strip_option))]
     pub inference_callback: Option<InferenceCallback>,
+
+    /// Optional conversation history inserted **after** the system prompt and
+    /// **before** the loop accepts new [`UserRequest`] messages.
+    ///
+    /// Hosts use this for session continuation (e.g. replaying prior turns).
+    /// Each message is pushed via [`Self::messages_push_callback`]. Seed-only
+    /// history does not trigger an LLM turn by itself — the loop still waits
+    /// for an incoming user message (or a prior tool-call continuation path).
+    ///
+    /// Callers should supply a legal chat prefix (typically user / assistant /
+    /// tool turns). Do not include a system message here; the live
+    /// [`Self::system_prompt`] is always message 0.
+    #[builder(default)]
+    pub seed_messages: Vec<ChatCompletionRequestMessage>,
 }
 
 impl AgentInvocationArgs {
@@ -447,6 +461,20 @@ impl AgentInvocation {
                 .into(),
         ];
         debug!(target: "da_harness::multi_tool", role = "system", msg = %&self.system_prompt);
+
+        // Session-continuation seed: after system, before any new user input.
+        let seed_n = self.seed_messages.len();
+        if seed_n > 0 {
+            info!(
+                target: "da_harness::multi_tool",
+                seed_messages = seed_n,
+                "seeding conversation history after system prompt"
+            );
+            for msg in self.seed_messages.drain(..) {
+                messages.push(msg);
+                (self.messages_push_callback)(messages.last().unwrap());
+            }
+        }
 
         let mut prev_call = false;
 
@@ -1092,6 +1120,101 @@ mod tests {
         assert!(
             msg.contains("mock boom") || msg.contains("inference callback"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_messages_appear_before_new_user_turn() {
+        use std::sync::Mutex;
+
+        let pushed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let pushed_cb = pushed.clone();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let seed_user = ChatCompletionRequestUserMessageArgs::default()
+            .content("prior user turn")
+            .build()
+            .unwrap()
+            .into();
+        let seed_asst = ChatCompletionRequestAssistantMessageArgs::default()
+            .content("prior assistant turn")
+            .build()
+            .unwrap()
+            .into();
+
+        let cb: InferenceCallback = Arc::new(|messages| {
+            async move {
+                // system + 2 seed + new user
+                assert!(
+                    messages.len() >= 4,
+                    "expected system + seed×2 + user, got {}",
+                    messages.len()
+                );
+                let texts: Vec<String> = messages.iter().map(|m| format!("{m:?}")).collect();
+                assert!(
+                    texts.iter().any(|s| s.contains("prior user turn")),
+                    "seed user missing: {texts:?}"
+                );
+                assert!(
+                    texts.iter().any(|s| s.contains("prior assistant turn")),
+                    "seed assistant missing: {texts:?}"
+                );
+                assert!(
+                    texts.iter().any(|s| s.contains("fresh user")),
+                    "new user missing: {texts:?}"
+                );
+                // seed comes before fresh user
+                let seed_idx = texts
+                    .iter()
+                    .position(|s| s.contains("prior assistant turn"))
+                    .unwrap();
+                let fresh_idx = texts.iter().position(|s| s.contains("fresh user")).unwrap();
+                assert!(seed_idx < fresh_idx);
+                Ok(assistant_text("ok after seed"))
+            }
+            .boxed()
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .incoming(rx)
+            .seed_messages(vec![seed_user, seed_asst])
+            .inference_callback(cb)
+            .messages_push_callback({
+                let done_tx = done_tx.clone();
+                let cb: MessagesPushCallback = Arc::new(move |msg| {
+                    let s = format!("{msg:?}");
+                    if s.contains("ok after seed") {
+                        let _ = done_tx.try_send(());
+                    }
+                    pushed_cb.lock().unwrap().push(s);
+                });
+                cb
+            })
+            .build()
+            .unwrap();
+
+        let run = tokio::spawn(invocation.run_without_client());
+        // Seed must not alone trigger inference; send a fresh user message.
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("fresh user".into()),
+        ))
+        .await
+        .unwrap();
+        done_rx.recv().await.expect("assistant reply");
+        drop(tx);
+
+        run.await.expect("join").unwrap();
+
+        let log = pushed.lock().unwrap();
+        assert!(
+            log.iter().any(|s| s.contains("prior user turn")),
+            "seed user should be pushed; got {log:?}"
+        );
+        assert!(
+            log.iter().any(|s| s.contains("prior assistant turn")),
+            "seed assistant should be pushed; got {log:?}"
         );
     }
 }
