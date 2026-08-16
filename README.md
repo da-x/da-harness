@@ -298,7 +298,8 @@ let compact = Tool::new_rewriting(Arc::new(|args: CompactArgs, mut messages| {
             kept.extend(messages.drain(tail_start..));
             messages = kept;
         }
-        // Keep the trailing assistant tool_calls turn so the loop can append
+        // Keep the assistant tool_calls turn (and any sibling role=tool
+        // results already appended in this batch) so the loop can append
         // this tool's result (OpenAI protocol).
         let content = format!("history now has {} messages", messages.len());
         Ok((content, messages))
@@ -309,9 +310,9 @@ let compact = Tool::new_rewriting(Arc::new(|args: CompactArgs, mut messages| {
 **Invariants** (see `multi_tool` module docs for full detail):
 
 1. The handler receives an **owned snapshot** of history (so it may `.await`, e.g. call an LLM to summarize) and returns `(tool_content, new_messages)`.
-2. `new_messages` must remain a valid prefix for appending one more `role=tool` message for this call — usually keep the trailing assistant `tool_calls` message.
-3. Batches that include any rewriting tool run **serially** even when `parallel_tools` is true.
-4. Persistence hosts should honor `messages_replace_callback` as authoritative after a rewrite; `messages_push_callback` alone is append-only.
+2. `new_messages` must remain a valid prefix for appending one more `role=tool` message for this call: the assistant `tool_calls` turn, optionally followed by sibling `role=tool` results from the same serial batch. Returning the snapshot unchanged is an identity rewrite (no `messages_replace_callback`).
+3. Batches that include any rewriting tool run **serially** even when `parallel_tools` is true. Identity-style tools are safe anywhere in the batch; prefer calling **destructive** rewrites alone or last.
+4. Persistence hosts should honor `messages_replace_callback` as authoritative after a rewrite; `messages_push_callback` alone is append-only. Identity rewrites do not fire the replace callback.
 
 ## Prompt Structure
 

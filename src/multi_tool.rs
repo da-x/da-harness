@@ -24,10 +24,16 @@
 //!
 //! 1. Be a legal chat prefix for appending one more `role=tool` message with
 //!    this call's `tool_call_id`.
-//! 2. Typically end with that same assistant `tool_calls` message (or an
-//!    equivalent one that still lists this id).
+//! 2. End with that assistant `tool_calls` turn, **or** with sibling `role=tool`
+//!    results from this batch that immediately follow it. After an earlier
+//!    sibling has appended its result, last is a `Tool` message — that is
+//!    valid. A trailing `User` / `System` is not.
 //! 3. **Not** already include the tool response for this call — the loop
 //!    appends it after the handler returns.
+//!
+//! Returning the snapshot unchanged is an **identity rewrite** (e.g. a mark
+//! that only produces a tool result). The loop then skips
+//! [`AgentInvocation::messages_replace_callback`] and does not swap history.
 //!
 //! A common self-compaction shape:
 //!
@@ -42,8 +48,9 @@
 //! Rewriting needs exclusive ownership of history. If **any** tool call in a
 //! batch is a rewriting tool, that batch runs **serially** (even when
 //! `parallel_tools` is true). Tool order from the model is preserved: a rewrite
-//! sees only tool results already appended earlier in the same batch. Prefer
-//! calling rewrite tools alone (or last) from the model side.
+//! sees only tool results already appended earlier in the same batch.
+//! Identity-style tools (return the snapshot unchanged) are safe anywhere in
+//! the batch. Prefer calling **destructive** rewrite tools alone (or last).
 //!
 //! ## Persistence
 //!
@@ -275,7 +282,9 @@ impl Tool {
     /// # Protocol
     ///
     /// `new_messages` must remain a valid prefix for appending this tool's
-    /// response (usually keep the trailing assistant `tool_calls` message).
+    /// response: the assistant `tool_calls` turn, optionally followed by
+    /// sibling `role=tool` results already appended in this batch. Returning
+    /// the snapshot unchanged is an identity rewrite (no replace callback).
     /// See the [module-level docs](self).
     pub fn new_rewriting<T>(callback: TypedRewritingCallback<T>) -> anyhow::Result<Self>
     where
@@ -426,6 +435,27 @@ impl AgentInvocationArgs {
         self.retry_strategy = Some(Some(factory));
         self
     }
+}
+
+/// Whether `messages` can take one more `role=tool` for `tool_call_id`.
+///
+/// Walks backward over any trailing sibling `Tool` results; the first
+/// non-tool message must be an `Assistant`. If that turn lists `tool_calls`,
+/// it must include `tool_call_id`.
+fn can_append_tool_result(messages: &[ChatCompletionRequestMessage], tool_call_id: &str) -> bool {
+    for msg in messages.iter().rev() {
+        match msg {
+            ChatCompletionRequestMessage::Tool(_) => continue,
+            ChatCompletionRequestMessage::Assistant(asst) => {
+                return match &asst.tool_calls {
+                    None => true,
+                    Some(calls) => calls.iter().any(|c| c.id == tool_call_id),
+                };
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 impl AgentInvocation {
@@ -730,15 +760,19 @@ impl AgentInvocation {
                     "rewriting tool '{}' returned an empty message list",
                     name
                 );
-                // Soft check: last message should still be the assistant tool_calls
-                // turn so appending this tool response stays protocol-valid.
+
+                // Identity: handler returned the snapshot unchanged (e.g. Folding::Mark).
+                // Sibling tool results from this batch may already follow the assistant
+                // turn; do not treat that as a rewrite and do not fire replace.
+                if new_messages == *messages {
+                    return Ok(content);
+                }
+
                 anyhow::ensure!(
-                    matches!(
-                        new_messages.last(),
-                        Some(ChatCompletionRequestMessage::Assistant(_))
-                    ),
-                    "rewriting tool '{}' should leave a trailing assistant message \
-                     (usually the tool_calls turn) so the tool result can be appended",
+                    can_append_tool_result(&new_messages, &tool_call.id),
+                    "rewriting tool '{}' must return a legal prefix for appending \
+                     this tool result (assistant tool_calls turn, optionally \
+                     followed by sibling role=tool messages)",
                     name
                 );
 
@@ -815,13 +849,17 @@ mod tests {
     use super::*;
     use async_openai::types::{
         ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionToolType, FunctionCall,
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionToolType, FunctionCall,
     };
 
     /// Minimal tool schema args for unit tests.
     #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
     struct NoArgs {}
+
+    /// Identity rewriting tool (returns the snapshot unchanged).
+    #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+    struct Mark {}
 
     #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
     struct KeepLast {
@@ -830,14 +868,27 @@ mod tests {
     }
 
     fn dummy_tool_call(name: &str, args: &str) -> ChatCompletionMessageToolCall {
+        dummy_tool_call_id("call_test", name, args)
+    }
+
+    fn dummy_tool_call_id(id: &str, name: &str, args: &str) -> ChatCompletionMessageToolCall {
         ChatCompletionMessageToolCall {
-            id: "call_test".into(),
+            id: id.into(),
             r#type: ChatCompletionToolType::Function,
             function: FunctionCall {
                 name: name.into(),
                 arguments: args.into(),
             },
         }
+    }
+
+    fn tool_result_msg(call_id: &str, content: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestToolMessageArgs::default()
+            .tool_call_id(call_id)
+            .content(content)
+            .build()
+            .unwrap()
+            .into()
     }
 
     #[tokio::test]
@@ -901,12 +952,11 @@ mod tests {
                 .unwrap()
                 .into(),
             ChatCompletionRequestAssistantMessageArgs::default()
-                .content("asst")
+                .tool_calls(vec![dummy_tool_call("KeepLast", r#"{"n":1}"#)])
                 .build()
                 .unwrap()
                 .into(),
         ];
-        // Pretend the last message is the tool_calls turn; we only check rewrite length.
         let before = messages.len();
         assert_eq!(before, 4);
 
@@ -920,6 +970,199 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(content.contains("kept 2"));
         assert_eq!(*replaced.lock().unwrap(), Some((before, 2)));
+    }
+
+    fn invocation_with_rewrite_tool(
+        tool: Tool,
+        replaced: Arc<std::sync::Mutex<bool>>,
+    ) -> AgentInvocation {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .tools(vec![tool])
+            .incoming(rx)
+            .messages_replace_callback({
+                let cb: MessagesReplaceCallback = Arc::new(move |_, _| {
+                    *replaced.lock().unwrap() = true;
+                });
+                cb
+            })
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn identity_rewrite_after_sibling_tool_result_is_noop() {
+        let tool = Tool::new_rewriting(Arc::new(|_: Mark, messages| {
+            async move { Ok(("OK mark".to_owned(), messages)) }.boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(std::sync::Mutex::new(false));
+        let invocation = invocation_with_rewrite_tool(tool, replaced.clone());
+
+        let sibling = dummy_tool_call_id("call_todo", "Todo", "{}");
+        let mark = dummy_tool_call_id("call_mark", "Mark", "{}");
+        let mut messages = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("go")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![sibling, mark.clone()])
+                .build()
+                .unwrap()
+                .into(),
+            tool_result_msg("call_todo", "todo-ok"),
+        ];
+        let before = messages.clone();
+
+        let content = invocation
+            .execute_tool_serial(&mark, &mut messages)
+            .await
+            .unwrap();
+
+        assert_eq!(content, "OK mark");
+        assert_eq!(messages, before);
+        assert!(
+            !*replaced.lock().unwrap(),
+            "identity rewrite must not fire replace callback"
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(ChatCompletionRequestMessage::Tool(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn identity_rewrite_when_last_is_assistant_is_noop() {
+        let tool = Tool::new_rewriting(Arc::new(|_: Mark, messages| {
+            async move { Ok(("OK mark".to_owned(), messages)) }.boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(std::sync::Mutex::new(false));
+        let invocation = invocation_with_rewrite_tool(tool, replaced.clone());
+
+        let mark = dummy_tool_call_id("call_mark", "Mark", "{}");
+        let mut messages = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("go")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![mark.clone()])
+                .build()
+                .unwrap()
+                .into(),
+        ];
+
+        let content = invocation
+            .execute_tool_serial(&mark, &mut messages)
+            .await
+            .unwrap();
+
+        assert_eq!(content, "OK mark");
+        assert!(!*replaced.lock().unwrap());
+        assert!(matches!(
+            messages.last(),
+            Some(ChatCompletionRequestMessage::Assistant(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rewriting_tool_ending_with_user_is_rejected() {
+        let tool = Tool::new_rewriting(Arc::new(|_: NoArgs, mut messages| {
+            async move {
+                messages.push(
+                    ChatCompletionRequestUserMessageArgs::default()
+                        .content("summary")
+                        .build()
+                        .unwrap()
+                        .into(),
+                );
+                Ok(("folded".to_owned(), messages))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(std::sync::Mutex::new(false));
+        let invocation = invocation_with_rewrite_tool(tool, replaced.clone());
+
+        let tc = dummy_tool_call("NoArgs", "{}");
+        let mut messages = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![tc.clone()])
+                .build()
+                .unwrap()
+                .into(),
+        ];
+
+        let err = invocation
+            .execute_tool_serial(&tc, &mut messages)
+            .await
+            .expect_err("user-trailing rewrite must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("legal prefix"), "unexpected error: {msg}");
+        assert!(!*replaced.lock().unwrap());
+        assert!(matches!(
+            messages.last(),
+            Some(ChatCompletionRequestMessage::Assistant(_))
+        ));
+    }
+
+    #[test]
+    fn can_append_tool_result_accepts_assistant_or_sibling_tool_tail() {
+        let mark = dummy_tool_call_id("c2", "Mark", "{}");
+        let asst: ChatCompletionRequestMessage =
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![dummy_tool_call_id("c1", "Todo", "{}"), mark.clone()])
+                .build()
+                .unwrap()
+                .into();
+        let with_tail = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            asst.clone(),
+            tool_result_msg("c1", "todo-ok"),
+        ];
+        assert!(can_append_tool_result(&with_tail, "c2"));
+        assert!(!can_append_tool_result(&with_tail, "missing"));
+
+        let asst_only = vec![asst];
+        assert!(can_append_tool_result(&asst_only, "c2"));
+
+        let user_last = vec![
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("summary")
+                .build()
+                .unwrap()
+                .into(),
+        ];
+        assert!(!can_append_tool_result(&user_last, "c2"));
+        assert!(!can_append_tool_result(&[], "c2"));
     }
 
     #[tokio::test]
@@ -1088,6 +1331,110 @@ mod tests {
 
         assert_eq!(tool_hits.load(Ordering::SeqCst), 1);
         assert_eq!(saw_tool_result.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inference_identity_rewrite_mid_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ping_hits = Arc::new(AtomicUsize::new(0));
+        let ping_hits_cb = ping_hits.clone();
+        let ping = Tool::new(Arc::new(move |_: NoArgs| {
+            let hits = ping_hits_cb.clone();
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(format!("ping-{n}"))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let mark = Tool::new_rewriting(Arc::new(|_: Mark, messages| {
+            async move { Ok(("OK <fold-mark />".to_owned(), messages)) }.boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(AtomicUsize::new(0));
+        let replaced_cb = replaced.clone();
+        let step = Arc::new(AtomicUsize::new(0));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let cb: InferenceCallback = Arc::new(move |messages| {
+            let step = step.clone();
+            let done_tx = done_tx.clone();
+            async move {
+                let n = step.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => Ok(assistant_tool_calls(vec![
+                        dummy_tool_call_id("c1", "NoArgs", "{}"),
+                        dummy_tool_call_id("c2", "Mark", "{}"),
+                        dummy_tool_call_id("c3", "NoArgs", "{}"),
+                    ])),
+                    1 => {
+                        let texts: Vec<String> =
+                            messages.iter().map(|m| format!("{m:?}")).collect();
+                        let tool_n = texts
+                            .iter()
+                            .filter(|s| s.contains("tool_call_id") || s.contains("Tool"))
+                            .count();
+                        assert!(
+                            texts.iter().any(|s| s.contains("ping-1")),
+                            "first ping missing: {texts:?}"
+                        );
+                        assert!(
+                            texts.iter().any(|s| s.contains("fold-mark")),
+                            "identity mark result missing: {texts:?}"
+                        );
+                        assert!(
+                            texts.iter().any(|s| s.contains("ping-2")),
+                            "second ping missing: {texts:?}"
+                        );
+                        assert!(
+                            tool_n >= 3,
+                            "expected three tool results in history: {texts:?}"
+                        );
+                        let _ = done_tx.send(()).await;
+                        Ok(assistant_text("done"))
+                    }
+                    _ => Ok(assistant_text("extra")),
+                }
+            }
+            .boxed()
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .tools(vec![ping, mark])
+            .parallel_tools(true)
+            .incoming(rx)
+            .inference_callback(cb)
+            .messages_replace_callback({
+                let cb: MessagesReplaceCallback = Arc::new(move |_, _| {
+                    replaced_cb.fetch_add(1, Ordering::SeqCst);
+                });
+                cb
+            })
+            .build()
+            .unwrap();
+
+        let run = tokio::spawn(invocation.run_without_client());
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("go".into()),
+        ))
+        .await
+        .unwrap();
+        done_rx.recv().await.expect("second inference turn");
+        drop(tx);
+
+        run.await.expect("join").unwrap();
+
+        assert_eq!(ping_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            replaced.load(Ordering::SeqCst),
+            0,
+            "identity Mark must not fire replace callback"
+        );
     }
 
     #[tokio::test]
