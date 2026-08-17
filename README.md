@@ -310,9 +310,10 @@ let compact = Tool::new_rewriting(Arc::new(|args: CompactArgs, mut messages| {
 **Invariants** (see `multi_tool` module docs for full detail):
 
 1. The handler receives an **owned snapshot** of history (so it may `.await`, e.g. call an LLM to summarize) and returns `(tool_content, new_messages)`.
-2. `new_messages` must remain a valid prefix for appending one more `role=tool` message for this call: the assistant `tool_calls` turn, optionally followed by sibling `role=tool` results from the same serial batch. Returning the snapshot unchanged is an identity rewrite (no `messages_replace_callback`).
-3. Batches that include any rewriting tool run **serially** even when `parallel_tools` is true. Identity-style tools are safe anywhere in the batch; prefer calling **destructive** rewrites alone or last.
-4. Persistence hosts should honor `messages_replace_callback` as authoritative after a rewrite; `messages_push_callback` alone is append-only. Identity rewrites do not fire the replace callback.
+2. **Keep this call:** `new_messages` must remain a valid prefix for appending one more `role=tool` message for this call: the assistant `tool_calls` turn, optionally followed by sibling `role=tool` results from the same serial batch. Returning the snapshot unchanged is an identity rewrite (no `messages_replace_callback`).
+3. **Consume this call:** omit this `tool_call_id` from every assistant `tool_calls` list and do not include a result for it. The loop does not append a tool result. Use this when the rewrite is meant to erase the tool itself from history.
+4. Batches that include any rewriting tool run **serially** even when `parallel_tools` is true. Identity-style tools are safe anywhere in the batch; prefer calling **destructive** rewrites alone or last.
+5. Persistence hosts should honor `messages_replace_callback` as authoritative after a rewrite; `messages_push_callback` alone is append-only. Identity rewrites do not fire the replace callback.
 
 ## Prompt Structure
 

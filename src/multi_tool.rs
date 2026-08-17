@@ -20,7 +20,9 @@
 //!
 //! When the handler runs, `messages` already includes the assistant message
 //! that requested this tool call (and any earlier tool results from the same
-//! serial batch). The returned list **must**:
+//! serial batch). The handler chooses one of two legal outcomes:
+//!
+//! **Keep this call** (typical self-compaction). The returned list **must**:
 //!
 //! 1. Be a legal chat prefix for appending one more `role=tool` message with
 //!    this call's `tool_call_id`.
@@ -30,6 +32,13 @@
 //!    valid. A trailing `User` / `System` is not.
 //! 3. **Not** already include the tool response for this call — the loop
 //!    appends it after the handler returns.
+//!
+//! **Consume this call** (the rewrite erases the tool from history). Omit this
+//! `tool_call_id` from every assistant `tool_calls` list and do not include a
+//! `role=tool` result for it. The loop then does **not** append a tool result.
+//! Remaining sibling `tool_calls` on that assistant (and their already-appended
+//! results) stay; an assistant left with no `tool_calls` and no content may be
+//! dropped, so history may end on a `User` summary.
 //!
 //! Returning the snapshot unchanged is an **identity rewrite** (e.g. a mark
 //! that only produces a tool result). The loop then skips
@@ -272,8 +281,11 @@ impl Tool {
     ///
     /// The callback receives `(args, messages_snapshot)` and returns
     /// `(tool_content, new_messages)`. The loop replaces in-memory history with
-    /// `new_messages`, fires [`AgentInvocation::messages_replace_callback`], then
-    /// appends a normal `role=tool` message with `tool_content`.
+    /// `new_messages` and fires [`AgentInvocation::messages_replace_callback`].
+    /// If the replacement still lists this call's `tool_call_id`, the loop then
+    /// appends a normal `role=tool` message with `tool_content`. If the handler
+    /// **consumed** the call (id absent from every assistant `tool_calls` list),
+    /// no result is appended and `tool_content` is only logged.
     ///
     /// Handlers that need async work (e.g. an LLM summarization call) can freely
     /// `.await` because they own the message snapshot — see module docs for why
@@ -281,11 +293,10 @@ impl Tool {
     ///
     /// # Protocol
     ///
-    /// `new_messages` must remain a valid prefix for appending this tool's
-    /// response: the assistant `tool_calls` turn, optionally followed by
-    /// sibling `role=tool` results already appended in this batch. Returning
-    /// the snapshot unchanged is an identity rewrite (no replace callback).
-    /// See the [module-level docs](self).
+    /// Either keep this call and return a valid prefix for appending its
+    /// result, or omit the call id (and any result for it) to consume the call.
+    /// Returning the snapshot unchanged is an identity rewrite (no replace
+    /// callback). See the [module-level docs](self).
     pub fn new_rewriting<T>(callback: TypedRewritingCallback<T>) -> anyhow::Result<Self>
     where
         T: for<'de> Deserialize<'de> + Clone + schemars::JsonSchema + 'static,
@@ -435,6 +446,28 @@ impl AgentInvocationArgs {
         self.retry_strategy = Some(Some(factory));
         self
     }
+}
+
+/// Whether any assistant turn still lists `tool_call_id` in `tool_calls`.
+fn history_has_tool_call_id(messages: &[ChatCompletionRequestMessage], tool_call_id: &str) -> bool {
+    messages.iter().any(|m| match m {
+        ChatCompletionRequestMessage::Assistant(asst) => asst
+            .tool_calls
+            .as_ref()
+            .is_some_and(|cs| cs.iter().any(|c| c.id == tool_call_id)),
+        _ => false,
+    })
+}
+
+/// Whether any `role=tool` message is a result for `tool_call_id`.
+fn history_has_tool_result_id(
+    messages: &[ChatCompletionRequestMessage],
+    tool_call_id: &str,
+) -> bool {
+    messages.iter().any(|m| match m {
+        ChatCompletionRequestMessage::Tool(t) => t.tool_call_id == tool_call_id,
+        _ => false,
+    })
 }
 
 /// Whether `messages` can take one more `role=tool` for `tool_call_id`.
@@ -659,14 +692,23 @@ impl AgentInvocation {
                         );
                     }
                     // Serial path: normal tools and/or rewriting tools in model order.
-                    // After each rewrite, `messages` is the handler's replacement list;
-                    // we then append this call's tool result (protocol requires it).
+                    // After a rewrite that *keeps* this call, `messages` is a prefix
+                    // and we append this call's tool result. A rewrite that *consumed*
+                    // the call (id no longer in any assistant `tool_calls`) is final.
                     for tc in tool_calls {
                         let content = match self.execute_tool_serial(tc, &mut messages).await {
                             Ok(s) => s,
                             Err(e) => format!("Error: {}", e),
                         };
-                        self.push_tool_result(&mut messages, tc, content)?;
+                        if history_has_tool_call_id(&messages, &tc.id) {
+                            self.push_tool_result(&mut messages, tc, content)?;
+                        } else {
+                            debug!(
+                                target: "da_harness::multi_tool",
+                                tool_call_id = %tc.id,
+                                "rewriting tool consumed its own call; skipping tool result"
+                            );
+                        }
                     }
                 }
             }
@@ -731,7 +773,8 @@ impl AgentInvocation {
     ///
     /// - **Normal:** same as [`Self::execute_tool`].
     /// - **Rewriting:** snapshot → handler → replace `messages` → replace callback.
-    ///   Does **not** append the tool result; the caller does that next.
+    ///   Does **not** append the tool result; the caller does that next when
+    ///   this call's id is still present in history.
     async fn execute_tool_serial(
         &self,
         tool_call: &async_openai::types::ChatCompletionMessageToolCall,
@@ -768,13 +811,23 @@ impl AgentInvocation {
                     return Ok(content);
                 }
 
-                anyhow::ensure!(
-                    can_append_tool_result(&new_messages, &tool_call.id),
-                    "rewriting tool '{}' must return a legal prefix for appending \
-                     this tool result (assistant tool_calls turn, optionally \
-                     followed by sibling role=tool messages)",
-                    name
-                );
+                if history_has_tool_call_id(&new_messages, &tool_call.id) {
+                    anyhow::ensure!(
+                        can_append_tool_result(&new_messages, &tool_call.id),
+                        "rewriting tool '{}' must return a legal prefix for appending \
+                         this tool result (assistant tool_calls turn, optionally \
+                         followed by sibling role=tool messages)",
+                        name
+                    );
+                } else {
+                    anyhow::ensure!(
+                        !history_has_tool_result_id(&new_messages, &tool_call.id),
+                        "rewriting tool '{}' removed its tool_call but left a \
+                         role=tool result for {}",
+                        name,
+                        tool_call.id
+                    );
+                }
 
                 info!(
                     target: "da_harness::multi_tool",
@@ -1130,6 +1183,121 @@ mod tests {
         ));
     }
 
+    /// Drop assistant `tool_calls` named `name` and any matching `role=tool` results.
+    fn strip_named_tool_calls(messages: &mut Vec<ChatCompletionRequestMessage>, name: &str) {
+        let mut drop_ids = std::collections::HashSet::new();
+        for m in messages.iter_mut() {
+            if let ChatCompletionRequestMessage::Assistant(asst) = m {
+                if let Some(calls) = asst.tool_calls.as_mut() {
+                    calls.retain(|c| {
+                        if c.function.name == name {
+                            drop_ids.insert(c.id.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if calls.is_empty() {
+                        asst.tool_calls = None;
+                    }
+                }
+            }
+        }
+        messages.retain(|m| match m {
+            ChatCompletionRequestMessage::Tool(t) => !drop_ids.contains(&t.tool_call_id),
+            _ => true,
+        });
+    }
+
+    #[tokio::test]
+    async fn rewriting_tool_may_consume_its_own_call() {
+        let tool = Tool::new_rewriting(Arc::new(|_: Mark, mut messages| {
+            async move {
+                strip_named_tool_calls(&mut messages, "Mark");
+                Ok(("consumed".to_owned(), messages))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(std::sync::Mutex::new(false));
+        let invocation = invocation_with_rewrite_tool(tool, replaced.clone());
+
+        let sibling = dummy_tool_call_id("call_todo", "Todo", "{}");
+        let mark = dummy_tool_call_id("call_mark", "Mark", "{}");
+        let mut messages = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("go")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![sibling, mark.clone()])
+                .build()
+                .unwrap()
+                .into(),
+            tool_result_msg("call_todo", "todo-ok"),
+        ];
+
+        let content = invocation
+            .execute_tool_serial(&mark, &mut messages)
+            .await
+            .unwrap();
+
+        assert_eq!(content, "consumed");
+        assert!(*replaced.lock().unwrap());
+        assert!(!history_has_tool_call_id(&messages, "call_mark"));
+        assert!(history_has_tool_call_id(&messages, "call_todo"));
+        assert!(history_has_tool_result_id(&messages, "call_todo"));
+        assert!(!history_has_tool_result_id(&messages, "call_mark"));
+    }
+
+    #[tokio::test]
+    async fn rewriting_tool_consume_leaving_own_result_is_rejected() {
+        let tool = Tool::new_rewriting(Arc::new(|_: Mark, mut messages| {
+            async move {
+                // Drop the call but leave a fabricated result — illegal consume.
+                strip_named_tool_calls(&mut messages, "Mark");
+                messages.push(tool_result_msg("call_mark", "leftover"));
+                Ok(("consumed".to_owned(), messages))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let replaced = Arc::new(std::sync::Mutex::new(false));
+        let invocation = invocation_with_rewrite_tool(tool, replaced.clone());
+
+        let mark = dummy_tool_call_id("call_mark", "Mark", "{}");
+        let mut messages = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("sys")
+                .build()
+                .unwrap()
+                .into(),
+            ChatCompletionRequestAssistantMessageArgs::default()
+                .tool_calls(vec![mark.clone()])
+                .build()
+                .unwrap()
+                .into(),
+        ];
+
+        let err = invocation
+            .execute_tool_serial(&mark, &mut messages)
+            .await
+            .expect_err("consume must not leave its own tool result");
+        assert!(
+            err.to_string().contains("left a role=tool result"),
+            "unexpected error: {err}"
+        );
+        assert!(!*replaced.lock().unwrap());
+    }
+
     #[test]
     fn can_append_tool_result_accepts_assistant_or_sibling_tool_tail() {
         let mark = dummy_tool_call_id("c2", "Mark", "{}");
@@ -1435,6 +1603,95 @@ mod tests {
             0,
             "identity Mark must not fire replace callback"
         );
+    }
+
+    #[tokio::test]
+    async fn inference_consume_own_call_skips_tool_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ping_hits = Arc::new(AtomicUsize::new(0));
+        let ping_hits_cb = ping_hits.clone();
+        let ping = Tool::new(Arc::new(move |_: NoArgs| {
+            let hits = ping_hits_cb.clone();
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(format!("ping-{n}"))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let consume = Tool::new_rewriting(Arc::new(|_: Mark, mut messages| {
+            async move {
+                strip_named_tool_calls(&mut messages, "Mark");
+                Ok(("SHOULD-NOT-APPEAR".to_owned(), messages))
+            }
+            .boxed()
+        }))
+        .unwrap();
+
+        let step = Arc::new(AtomicUsize::new(0));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let cb: InferenceCallback = Arc::new(move |messages| {
+            let step = step.clone();
+            let done_tx = done_tx.clone();
+            async move {
+                let n = step.fetch_add(1, Ordering::SeqCst);
+                match n {
+                    0 => Ok(assistant_tool_calls(vec![
+                        dummy_tool_call_id("c1", "NoArgs", "{}"),
+                        dummy_tool_call_id("c2", "Mark", "{}"),
+                        dummy_tool_call_id("c3", "NoArgs", "{}"),
+                    ])),
+                    1 => {
+                        let texts: Vec<String> =
+                            messages.iter().map(|m| format!("{m:?}")).collect();
+                        assert!(
+                            texts.iter().any(|s| s.contains("ping-1")),
+                            "first ping missing: {texts:?}"
+                        );
+                        assert!(
+                            texts.iter().any(|s| s.contains("ping-2")),
+                            "second ping missing: {texts:?}"
+                        );
+                        assert!(
+                            !texts.iter().any(|s| s.contains("SHOULD-NOT-APPEAR")),
+                            "consumed call must not append a tool result: {texts:?}"
+                        );
+                        assert!(
+                            !history_has_tool_call_id(&messages, "c2"),
+                            "consumed Mark tool_call must be gone: {texts:?}"
+                        );
+                        let _ = done_tx.send(()).await;
+                        Ok(assistant_text("done"))
+                    }
+                    _ => Ok(assistant_text("extra")),
+                }
+            }
+            .boxed()
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let invocation = AgentInvocationArgs::default()
+            .system_prompt("sys")
+            .tools(vec![ping, consume])
+            .incoming(rx)
+            .inference_callback(cb)
+            .build()
+            .unwrap();
+
+        let run = tokio::spawn(invocation.run_without_client());
+        tx.send(UserRequest::Message(
+            ChatCompletionRequestUserMessageContent::Text("go".into()),
+        ))
+        .await
+        .unwrap();
+        done_rx.recv().await.expect("second inference turn");
+        drop(tx);
+
+        run.await.expect("join").unwrap();
+        assert_eq!(ping_hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
